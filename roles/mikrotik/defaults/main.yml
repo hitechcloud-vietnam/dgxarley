@@ -1,0 +1,18 @@
+---
+mikrotik_bridge_name: bridge
+mikrotik_bridge_ports: []
+mikrotik_bridge_vlans: []
+mikrotik_mgmt_interfaces: []
+mikrotik_dns_servers: []
+mikrotik_dhcp_servers: []
+mikrotik_srcnat_rules: []
+mikrotik_fasttrack_enabled: false
+
+# RoCE/RDMA lossless Ethernet — only active when qsfp_switch: true
+mikrotik_qsfp_roce_ports: []
+mikrotik_qsfp_mtu: 9000
+mikrotik_qsfp_l2mtu: 9500
+mikrotik_roce_dscp_data: 26
+mikrotik_roce_dscp_cnp: 48
+mikrotik_roce_traffic_class: 3
+mikrotik_cnp_traffic_class: 6

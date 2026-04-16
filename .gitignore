@@ -1,0 +1,19 @@
+/env
+/.claude
+.proxyai
+.venv/
+__pycache__/
+*.pyc
+.idea/
+*.retry
+.mypy_cache/
+*.local
+*.local.*
+artifacts/
+
+/dist
+
+/CLAUDE.md
+
+## Re-include host_vars directories named *.local (Ansible inventory hostnames)
+#!host_vars/*.local/

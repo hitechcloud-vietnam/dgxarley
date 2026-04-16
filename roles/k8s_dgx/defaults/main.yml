@@ -1,0 +1,604 @@
+---
+# Traefik IP-Allowlist for internal services (overridden by vault)
+traefik_internal_allowlist:
+  - "192.168.123.0/24"
+  - "192.168.124.0/24"
+  - "{{ cluster_cidr }}"
+  - "{{ service_cidr }}"
+
+sglang_namespace: "sglang"
+vllm_namespace: "vllm"
+openwebui_namespace: "openwebui"
+
+# curl -s 'https://hub.docker.com/v2/repositories/scitrera/dgx-spark-sglang/tags/?page_size=20&ordering=last_updated' | jq '.results[] | {name, last_updated}'
+#sglang_image: "scitrera/dgx-spark-sglang:0.5.9-t5"
+#sglang_image: "scitrera/dgx-spark-sglang:0.5.9-dev2-acab24a7-t5"
+#sglang_image: "scitrera/dgx-spark-sglang:0.5.10rc0"
+#sglang_image: "scitrera/dgx-spark-sglang:0.5.10"
+
+# sglang_image: "scitrera/dgx-spark-sglang:0.5.10"
+
+#sglang_image: "xomoxcc/dgx-spark-sglang:0.5.10-sm121"
+#sglang_image: "xomoxcc/dgx-spark-sglang:main-gemma4-sm121"
+sglang_image: "scitrera/dgx-spark-sglang:0.5.10"
+
+sglang_nnodes: 4
+
+# Model profiles are loaded from individual files in model_profiles/
+# by the merge task at the top of tasks/main.yml. See model_profiles/*.yml.
+# sglang_model_profiles dict is built at runtime via include_vars + combine.
+sglang_model_profiles: {}
+
+
+sglang_speculative_enabled: "{{ sglang_model_profiles[sglang_model].speculative_enabled | default(false) }}"
+sglang_speculative_algo: "{{ sglang_model_profiles[sglang_model].speculative_algo | default('NEXTN') }}"
+sglang_speculative_num_steps: "{{ sglang_model_profiles[sglang_model].speculative_num_steps | default(3) }}"
+sglang_speculative_eagle_topk: "{{ sglang_model_profiles[sglang_model].speculative_eagle_topk | default(1) }}"
+sglang_speculative_num_draft_tokens: "{{ sglang_model_profiles[sglang_model].speculative_num_draft_tokens | default(4) }}"
+# Draft model path for EAGLE/EAGLE3. Empty = use model's own MTP heads (NEXTN).
+# For external draft models: set to the HF model ID (e.g. "togethercomputer/Aurora-Spec-Minimax-M2.5").
+sglang_speculative_draft_model_path: "{{ sglang_model_profiles[sglang_model].speculative_draft_model_path | default('') }}"
+# Quantization method for the draft model. By default SGLang inherits the
+# target model's quantization — which breaks when the target is modelopt-
+# quantized (e.g. NVFP4) but the draft ships as plain BF16 (the usual case
+# for external EAGLE3 drafts like lmsys/Qwen3-235B-A22B-EAGLE3). The draft
+# worker then routes through _load_modelopt_base_model and tries to
+# reinstantiate a full Qwen3MoE from a single-layer EAGLE3 checkpoint,
+# producing a state-dict shape mismatch on lm_head (32000 vs 151936) and
+# missing layer weights.
+# Set to "unquant" to force SGLang to load the draft without quantization.
+# Empty string (default) = inherit target quantization (SGLang's default).
+sglang_speculative_draft_model_quantization: "{{ sglang_model_profiles[sglang_model].speculative_draft_model_quantization | default('') }}"
+
+# Mamba scheduler strategy — required for hybrid-attention models (Qwen3.5 MoE)
+# when speculative decoding is enabled. "extra_buffer" enables radix cache
+# compatibility with MTP. Empty string = SGLang default (no_buffer).
+sglang_mamba_scheduler_strategy: "{{ sglang_model_profiles[sglang_model].mamba_scheduler_strategy | default('') }}"
+
+# Enable MTP spec_v2 — required alongside mamba_scheduler_strategy=extra_buffer
+# for speculative decoding on hybrid-attention models. Sets SGLANG_ENABLE_SPEC_V2=1.
+sglang_enable_spec_v2: "{{ sglang_model_profiles[sglang_model].enable_spec_v2 | default(false) }}"
+
+# Select the active model — parameters are pulled from sglang_model_profiles
+#sglang_model: "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+#sglang_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+#sglang_model: "Qwen/Qwen3.5-35B-A3B-FP8"
+#sglang_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+
+sglang_model: "nvidia/Qwen3.5-397B-A17B-NVFP4"
+# sglang_model: "google/gemma-4-26B-A4B-it"
+# sglang_model: "nvidia/Qwen3-235B-A22B-NVFP4"
+# sglang_model: "zai-org/GLM-4.7-FP8"
+
+# sglang_model: "nvidia/Qwen3.5-397B-A17B-NVFP4"
+# sglang_model: "nvidia/Qwen3.5-397B-A17B-NVFP4"
+# sglang_model: "nvidia/GLM-4.7-NVFP4"
+# sglang_model: "nvidia/GLM-5-NVFP4"
+#sglang_model: "nvidia/MiniMax-M2.5-NVFP4"
+#sglang_model: "Qwen/Qwen3.5-122B-A10B-FP8"
+#sglang_model: "QuantTrio/Qwen3-235B-A22B-Thinking-2507-AWQ"
+#sglang_model: "QuantTrio/Qwen3-235B-A22B-Instruct-2507-AWQ"
+#sglang_model: "google/gemma-4-31B-it"        # 30.7B dense, multimodal, 256K ctx
+#sglang_model: "google/gemma-4-26B-A4B-it"    # 26B/3.8B-active MoE, multimodal, 256K ctx
+
+sglang_context_length: "{{ sglang_model_profiles[sglang_model].context_length }}"
+sglang_kv_cache_dtype: "{{ sglang_model_profiles[sglang_model].kv_cache_dtype }}"
+sglang_mem_fraction_static: "{{ sglang_model_profiles[sglang_model].mem_fraction_static }}"
+sglang_reasoning_parser: "{{ sglang_model_profiles[sglang_model].reasoning_parser | default('') }}"
+sglang_tool_call_parser: "{{ sglang_model_profiles[sglang_model].tool_call_parser | default('') }}"
+sglang_quantization: "{{ sglang_model_profiles[sglang_model].quantization | default('') }}"
+sglang_trust_remote_code: "{{ sglang_model_profiles[sglang_model].trust_remote_code | default(false) }}"
+# Raw JSON string passed to SGLang via --json-model-override-args. Used to
+# inject rope_scaling (YaRN) or other HF config overrides for models whose
+# shipped config.json lacks them. Empty string = flag omitted.
+sglang_json_model_override_args: "{{ sglang_model_profiles[sglang_model].json_model_override_args | default('') }}"
+sglang_moe_runner_backend: "{{ sglang_model_profiles[sglang_model].moe_runner_backend | default('') }}"
+# Load format: "auto" (default) or "sharded_state" (for pre-sharded models).
+# Use "sharded_state" after running sglang_shard Job to reduce peak GPU memory.
+sglang_load_format: "{{ sglang_model_profiles[sglang_model].load_format | default('auto') }}"
+# Disable DeepGemm JIT (sets SGLANG_ENABLE_JIT_DEEPGEMM=false) — needed for
+# FP8 models on GB10/SM121 where DeepGemm lacks recipes for certain kernel
+# configs (crashes with "Unknown recipe" during CUDA graph capture).
+sglang_disable_deep_gemm: "{{ sglang_model_profiles[sglang_model].disable_deep_gemm | default(false) }}"
+# FP8 GEMM runner backend: "auto" (default), "cutlass", "deep_gemm", "flashinfer".
+# On GB10/SM121, "auto" selects flashinfer which uses trtllm backend — unsupported
+# on SM121. FP8 models must use "cutlass" explicitly.
+sglang_fp8_gemm_runner_backend: "{{ sglang_model_profiles[sglang_model].fp8_gemm_runner_backend | default('auto') }}"
+# FP4 GEMM backend: "auto" (default), "flashinfer_cudnn", "cutlass".
+# Controls the GEMM kernel for W4A4 (FP4) quantized models. Not relevant for
+# AWQ (W4A16) or FP8 models — those use FP16/FP8 GEMM paths respectively.
+# On SM120 (Blackwell), "auto" selects flashinfer_cudnn (cuDNN-optimized kernels).
+sglang_fp4_gemm_backend: "{{ sglang_model_profiles[sglang_model].fp4_gemm_backend | default('auto') }}"
+# Maximum batch size for CUDA graph capture. Lower values reduce startup time.
+# Set to 0 to also disable (prefer disable_cuda_graph: true in model profile).
+# Default: 128 (SGLang default is 256, reduced for faster startup)
+sglang_cuda_graph_max_bs: "{{ sglang_model_profiles[sglang_model].cuda_graph_max_bs | default(128) }}"
+# Disable CUDA graph capture entirely (--disable-cuda-graph).
+# Emergency kill switch — overrides cuda_graph_max_bs when true.
+sglang_disable_cuda_graph: "{{ sglang_model_profiles[sglang_model].disable_cuda_graph | default(false) }}"
+# Disable piecewise CUDA graph capture (--disable-piecewise-cuda-graph).
+# Needed for NVFP4+EP models where capture OOMs on the all-reduce buffers.
+sglang_disable_piecewise_cuda_graph: "{{ sglang_model_profiles[sglang_model].disable_piecewise_cuda_graph | default(false) }}"
+# Disable the flashinfer_cutlass MoE FP4 allgather path
+# (--disable-flashinfer-cutlass-moe-fp4-allgather). Diagnostic switch for the
+# cudaErrorIllegalInstruction crashes seen on SM121 with moe_runner_backend=
+# flashinfer_cutlass at EP>1 (see Tests 13–15 in the EP=4 NVFP4 test log).
+sglang_disable_flashinfer_cutlass_moe_fp4_allgather: "{{ sglang_model_profiles[sglang_model].disable_flashinfer_cutlass_moe_fp4_allgather | default(false) }}"
+
+# Served model name for the OpenAI-compatible API. When load_format is
+# sharded_state, the model path becomes the shard directory — this overrides
+# that so clients (OpenWebUI etc.) see the original model name.
+sglang_served_model_name: "{{ sglang_model }}"
+
+# sglang default: os.cpu_count()
+sglang_jit_max_jobs: "{{ sglang_model_profiles[sglang_model].jit_max_jobs | default(4) }}"
+
+# Tensor parallelism: from model profile or nnodes (default).
+# With PP > 1 (pipeline parallelism), tp * pp = nnodes.
+sglang_tp: "{{ sglang_model_profiles[sglang_model].tp_size | default(sglang_nnodes) }}"
+# Pipeline parallelism: auto-derived as nnodes / tp_size.
+# PP > 1 distributes model layers across pipeline stages instead of sharding
+# weights via TP. Required when a model's num_key_value_heads isn't divisible
+# by nnodes (e.g. MiniMax M2.5: 8 KV heads, 8 % 3 ≠ 0 → can't use TP=3).
+sglang_pp: "{{ (sglang_nnodes | int) // (sglang_tp | int) }}"
+# PP async micro-batching depth: overlaps forward passes across pipeline stages.
+# 0 = synchronous (default). Only effective when pp > 1.
+sglang_pp_async_batch_depth: "{{ sglang_model_profiles[sglang_model].pp_async_batch_depth | default(0) }}"
+# Expert parallelism: partitions the TP group for MoE layers.
+# EP must divide TP (ep_size <= tp_size). With EP=TP, MoE layers use
+# all-to-all instead of all-reduce — more efficient for MoE over Ethernet.
+# Attention layers remain tensor-parallel regardless of EP.
+# Set per model profile; defaults to 1 (no expert parallelism).
+sglang_ep: "{{ sglang_model_profiles[sglang_model].ep_size | default(1) }}"
+# EP load balancer: dynamically rebalances expert assignment across ranks.
+# Only effective when ep_size > 1.
+sglang_enable_eplb: "{{ sglang_model_profiles[sglang_model].enable_eplb | default(false) }}"
+# Expert distribution metrics: logs per-expert load statistics via Prometheus.
+# Useful for monitoring EP balance. Only effective when ep_size > 1.
+sglang_enable_expert_distribution_metrics: "{{ sglang_model_profiles[sglang_model].enable_expert_distribution_metrics | default(false) }}"
+# NCCL transport: "roce" (RDMA/RoCE via IBext, GPU Direct) or "socket" (TCP/IP).
+# RoCE requires SR-IOV VFs with correct RoCE devices, GID table, and DCBX/PFC.
+# Socket is the safe fallback — works always, ~30% more latency per transfer.
+# Default: socket (safe, proven). roce only if explicitly requested in profile AND SR-IOV is enabled.
+# RoCE via IBext is currently 2× slower than socket (see TESTLOG) — do not auto-enable.
+_sglang_nccl_transport_requested: "{{ sglang_model_profiles[sglang_model].nccl_transport | default('socket') }}"
+sglang_nccl_transport: "{{ _sglang_nccl_transport_requested if (_sglang_nccl_transport_requested == 'socket' or (qsfp_sriov_enabled | default(false))) else 'socket' }}"
+# NCCL env vars derived from transport mode. Merged into the SGLang ConfigMap.
+# roce: RDMA/RoCE via HPC-X IBext plugin, GPU Direct DMABUF over SR-IOV VFs.
+# socket: TCP/IP over QSFP. Safe fallback, no RoCE/IB dependencies.
+_sglang_nccl_env_roce:
+  NCCL_IB_HCA: "roce{{ qsfp_sriov_vf_prefix | regex_replace('^en', '') }}v{{ qsfp_sriov_assignments.sglang.vf }}"
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_IB_MERGE_NICS: "0"
+_sglang_nccl_env_socket:
+  NCCL_NET: "Socket"
+  NCCL_IB_DISABLE: "1"
+sglang_nccl_env: "{{ _sglang_nccl_env_roce if sglang_nccl_transport == 'roce' else _sglang_nccl_env_socket }}"
+sglang_port: 8000
+sglang_internal_port: 30080
+sglang_haproxy_timeout: 1800
+sglang_dist_timeout: 1800
+# Timeout (seconds) for the head's wait-for-worker initContainer.
+# Must be long enough for all workers to become Ready (model download + pod scheduling).
+sglang_wait_timeout: 1200
+# Scheduler watchdog timeout (seconds). The scheduler subprocess is killed if
+# no forward pass completes within this window. Default 300s is too short for
+# the first forward pass on large MoE models — FlashInfer CUTLASS kernel loading
+# and cuDNN autotuning on the first request can take several minutes.
+sglang_watchdog_timeout: 3600
+
+# Max concurrent requests. Limits how many requests SGLang processes in parallel.
+# Set to 0 for unlimited (only bounded by KV-cache pool size).
+sglang_max_running_requests: 32
+
+# Schedule policy: "lpm" (longest prefix match) or "fcfs" (first come first served).
+# lpm reuses cached prefixes across requests (better for shared system prompts / RAG).
+# fcfs processes requests strictly in arrival order (fairer under heavy load).
+sglang_schedule_policy: "lpm"
+
+# Attention backend: per-model in sglang_model_profiles, defaults to "flashinfer".
+# Set to "triton" for hybrid GDN models (MoE+Mamba) on Blackwell GPUs.
+sglang_attention_backend: "{{ sglang_model_profiles[sglang_model].attention_backend | default('flashinfer') }}"
+
+# Chat template kwargs: passed as --chat-template-kwargs JSON to SGLang CLI.
+# Used for enable_thinking etc. — NOT for sampling params.
+# NOTE: thinking_budget does NOT go here — it uses SGLang's custom logit processor
+# system (Qwen3ThinkingBudgetLogitProcessor), set per request via custom_params.
+# Dual-layer reasoning defaults: chat_template_kwargs from the active model profile
+# flows to BOTH (1) SGLang server via --chat-template-kwargs (server-wide default)
+# and (2) LiteLLM extra_body via _sglang_extra_body_defaults (client-visible default).
+# Per-request extra_body from clients overrides both layers.
+sglang_chat_template_kwargs: "{{ sglang_model_profiles[sglang_model].chat_template_kwargs | default({}) }}"
+
+# Chunked prefill size: maximum number of tokens per prefill chunk.
+# Large values improve throughput for long prompts; lower values reduce
+# per-request latency and memory spikes. 0 = SGLang default (no override).
+sglang_chunked_prefill_size: "{{ sglang_model_profiles[sglang_model].chunked_prefill_size | default(0) }}"
+
+# MoE Triton kernel config directory (host path, under hf_cache_path).
+# Tuned configs are produced by the sglang_tune_moe Job.
+sglang_moe_config_path: "{{ hf_cache_path }}/moe_configs"
+sglang_moe_config_dir: "/root/.cache/huggingface/moe_configs"
+
+# ============================================================================
+# vLLM — drop-in alternative to SGLang for distributed LLM inference.
+# Uses the same model profiles, QSFP network, and HF cache.
+# Key differences from SGLang:
+#   - Multi-node via --distributed-executor-backend mp (no Ray needed)
+#   - No HAProxy sidecar (no EADDRINUSE bug)
+#   - EP is a boolean flag (--enable-expert-parallel), not numeric
+#   - --enforce-eager instead of --disable-cuda-graph
+#   - No generation_config.json patching (sampling defaults via API)
+# Both deployments can coexist but NOT run simultaneously (GPU contention).
+# ============================================================================
+vllm_image: "scitrera/dgx-spark-vllm:0.17.0-t5"
+
+# vLLM reuses sglang_model_profiles — same model, same quantization, same params.
+# Select the active model independently from SGLang.
+vllm_model: "{{ sglang_model }}"
+
+# Derived from the shared model profile (same as sglang_* equivalents)
+vllm_context_length: "{{ sglang_model_profiles[vllm_model].context_length }}"
+vllm_kv_cache_dtype: "{{ sglang_model_profiles[vllm_model].kv_cache_dtype }}"
+vllm_mem_fraction: "{{ sglang_model_profiles[vllm_model].mem_fraction_static }}"
+vllm_reasoning_parser: "{{ sglang_model_profiles[vllm_model].reasoning_parser | default('') }}"
+vllm_tool_call_parser: "{{ sglang_model_profiles[vllm_model].tool_call_parser | default('') }}"
+vllm_quantization: "{{ sglang_model_profiles[vllm_model].quantization | default('') }}"
+vllm_load_format: "{{ sglang_model_profiles[vllm_model].load_format | default('auto') }}"
+vllm_served_model_name: "{{ vllm_model }}"
+vllm_chat_template_kwargs: "{{ sglang_model_profiles[vllm_model].chat_template_kwargs | default({}) }}"
+
+# Expert parallelism: boolean flag in vLLM (--enable-expert-parallel).
+# EP size is implicit: EP = TP × DP. With TP=2, DP=1, EP=2.
+vllm_enable_ep: "{{ (sglang_model_profiles[vllm_model].ep_size | default(1) | int) > 1 }}"
+
+# CUDA graph: vLLM uses --enforce-eager to disable (no granular batch-size control).
+# Enable eager mode for MoE models on SM121 where CUDA graph capture is slow/fragile.
+vllm_enforce_eager: "{{ sglang_model_profiles[vllm_model].disable_deep_gemm | default(false) }}"
+
+vllm_nnodes: 2
+# Tensor parallelism: auto-derived from nnodes (1 GPU per DGX Spark).
+vllm_tp: "{{ vllm_nnodes }}"
+# Port 8001 to avoid clash with SGLang (8000) — both can have Services simultaneously.
+vllm_port: 8001
+vllm_dist_timeout: 1800
+vllm_wait_timeout: 1200
+
+# Max concurrent sequences (equivalent to sglang_max_running_requests)
+vllm_max_num_seqs: 16
+
+ollama_replicas: 1
+ollama_embed_replicas: 1
+
+# Ollama model profiles
+ollama_model_profiles:
+  "qwen3-coder:latest":
+    info_url: "https://ollama.com/library/qwen3-coder"
+    # 30B total / 3.3B active MoE, latest tag = 30b (~19 GB)
+    context_length: 262144
+  "qwen2.5-coder:latest":
+    info_url: "https://ollama.com/library/qwen2.5-coder"
+    # 7B dense, latest tag = 7b (~4.7 GB)
+    context_length: 32768
+  "qwen2.5-coder:14b":
+    info_url: "https://ollama.com/library/qwen2.5-coder:14b"
+    # 14B dense (~9 GB)
+    context_length: 32768
+
+# Ollama embedding model profiles
+ollama_embed_model_profiles:
+  "bge-m3":
+    info_url: "https://ollama.com/library/bge-m3"
+    # BAAI BGE-M3 multilingual embedding (~1.2 GB)
+    context_length: 8192
+
+# Active ollama model — parameters pulled from ollama_model_profiles
+#ollama_model: "qwen3-coder:latest"
+ollama_model: "qwen2.5-coder:latest"
+ollama_preload_models:
+  - "{{ ollama_model }}"
+
+# Active ollama embedding model — parameters pulled from ollama_embed_model_profiles
+ollama_embed_model: "bge-m3"
+ollama_embed_preload_models:
+  - "{{ ollama_embed_model }}"
+
+ollama_embedding_model: "{{ ollama_embed_model }}"
+ollama_embedding_model_max_ctx: "{{ ollama_embed_model_profiles[ollama_embed_model].context_length }}"
+ollama_port: 11434
+# TLS port for HAProxy sidecar — LiteLLM's ollama/ provider forces TLS on all
+# connections. Each Ollama pod runs an HAProxy sidecar (self-signed cert) that
+# terminates TLS and proxies to localhost:ollama_port.
+ollama_tls_port: 11435
+
+# Ollama runtime config
+ollama_num_parallel: 1
+ollama_max_loaded_models: 1
+ollama_keep_alive: "-1"
+ollama_flash_attention: 1
+ollama_kv_cache_type: "q8_0"
+ollama_context_length: "{{ ollama_model_profiles[ollama_model].context_length }}"
+
+# Ollama-embed runtime config (embedding-only instance)
+ollama_embed_num_parallel: 2
+ollama_embed_max_loaded_models: 1
+ollama_embed_keep_alive: "-1"
+ollama_embed_flash_attention: 1
+ollama_embed_kv_cache_type: "q8_0"
+ollama_embed_context_length: "{{ ollama_embed_model_profiles[ollama_embed_model].context_length }}"
+
+docling_port: 5001
+openwebui_image: "ghcr.io/open-webui/open-webui:main"
+pipelines_image: "ghcr.io/open-webui/pipelines:main"
+pipelines_port: 9099
+searxng_port: 8080
+# OpenWebUI configuration
+openwebui_secret_key: "CHANGEME_SECRET_KEY"
+openwebui_admin_name: "Admin User"
+openwebui_admin_email: "admin@example.com"
+openwebui_admin_password: "changeme"
+
+# Embedding engine: "openai" routes through LiteLLM (unified OpenAI-v1 interface).
+# Switch back to "ollama" + ollama_url for direct access without LiteLLM proxy.
+openwebui_embedding_engine: "openai"
+openwebui_embedding_openai_url: "http://litellm.{{ litellm_namespace }}.svc.cluster.local:4000/v1"
+openwebui_embedding_ollama_url: "http://ollama-embed.ollama.svc.cluster.local:{{ ollama_port }}"
+
+openwebui_embedding_chunk_size: 20000
+openwebui_embedding_chunk_overlap: 750
+openwebui_embedding_chunk_min_size: 100
+openwebui_embedding_batch_size: 16
+
+openwebui_content_extraction_engine: "docling"
+openwebui_docling_server_url: "http://docling.docling.svc.cluster.local:{{ docling_port }}"
+# openwebui_tei_openai_api_base_url: "http://tei.ollama.svc.cluster.local:8080/v1"
+openwebui_searxng_query_url: "http://searxng.searxng.svc.cluster.local:{{ searxng_port }}/search?q=<query>"
+openwebui_web_search_result_count: 5
+
+# Pipelines (filter/function plugins for OpenWebUI)
+# Master toggle — controls Deployment, Service, and OpenAI connection registration.
+pipelines_enabled: true
+# Which pipeline filter scripts to seed (files in roles/k8s_dgx/files/pipelines/)
+pipelines_filters:
+  - "pipelines_self_reflection_filter.py"
+
+# pipeline will be deployed, but this valve will disable it
+openwebui_self_reflection_enabled: false
+
+# OpenAI-compatible connections for OpenWebUI
+# Pipelines URL is appended automatically when pipelines_enabled is true.
+openwebui_connections_openai:
+  - "http://sglang.{{ sglang_namespace }}.svc.cluster.local:{{ sglang_port }}/v1"
+
+# QSFP IPs for NCCL bootstrap (PF mode — pod takes over host PF, so pod IP = host IP)
+qsfp_ip_spark1: "10.10.10.101"
+qsfp_ip_spark2: "10.10.10.102"
+qsfp_ip_spark3: "10.10.10.103"
+qsfp_ip_spark4: "10.10.10.104"
+
+# Host-PF QSFP IPs (the IPs configured on the physical PF interface via netplan).
+# These are reachable from hostNetwork pods and from the host itself. Different
+# from the qsfp_ip_sparkN / SR-IOV VF IPs which are only reachable inside Multus
+# pod namespaces. Used by the host-network NCCL test variant.
+# Real values in group_vars/all/vault.yml.
+qsfp_pf_ip_spark1: "10.10.10.1"
+qsfp_pf_ip_spark2: "10.10.10.2"
+qsfp_pf_ip_spark3: "10.10.10.3"
+qsfp_pf_ip_spark4: "10.10.10.4"
+
+# SR-IOV VF assignments per deployment.
+# Each deployment gets its own VF index + dedicated IPs per spark node.
+# This allows multiple engines to run on different VFs simultaneously.
+# vf: which VF index (maps to NAD qsfp-vfN and interface <prefix>vN)
+# head_ip: QSFP IP for the head pod (rank 0, spark1)
+# worker_ip1..N: QSFP IPs for worker pods (rank 1..N, spark2..N+1)
+qsfp_sriov_assignments:
+  sglang:
+    vf: 0
+    head_ip: "10.10.10.201"
+    worker_ip1: "10.10.10.202"
+    worker_ip2: "10.10.10.203"
+    worker_ip3: "10.10.10.204"
+  vllm:
+    vf: 1
+    head_ip: "10.10.10.205"
+    worker_ip1: "10.10.10.206"
+    worker_ip2: "10.10.10.207"
+    worker_ip3: "10.10.10.208"
+  sglang_shard:
+    vf: 2
+    head_ip: "10.10.10.209"
+    worker_ip1: "10.10.10.210"
+    worker_ip2: "10.10.10.211"
+    worker_ip3: "10.10.10.212"
+  vllm_shard:
+    vf: 3
+    head_ip: "10.10.10.213"
+    worker_ip1: "10.10.10.214"
+    worker_ip2: "10.10.10.215"
+    worker_ip3: "10.10.10.216"
+  iperf_test:
+    vf: 7
+    server_ip: "10.10.10.241"
+    client_ip: "10.10.10.242"
+    # Extended for 4-node NCCL test (reuses VF 7, same subnet).
+    # server_ip = rank 0 (spark1), client_ip = rank 1 (spark2).
+    head_ip: "10.10.10.241"
+    worker_ip1: "10.10.10.242"
+    worker_ip2: "10.10.10.243"
+    worker_ip3: "10.10.10.244"
+
+nccl_bootstrap_port: 50000
+nccl_socket_ifname: "net1"
+
+# Ordered QSFP IP lists per engine (index 0 = head/rank 0, index N = worker rank N).
+# PF mode: uses qsfp_ip_sparkN host variables.
+# SR-IOV mode: uses per-engine VF IPs from qsfp_sriov_assignments.
+# Sliced to nnodes so unused spark IPs are excluded.
+_qsfp_ips_pf_all:
+  - "{{ qsfp_ip_spark1 }}"
+  - "{{ qsfp_ip_spark2 }}"
+  - "{{ qsfp_ip_spark3 }}"
+  - "{{ qsfp_ip_spark4 }}"
+
+_sglang_qsfp_ips_sriov:
+  - "{{ qsfp_sriov_assignments.sglang.head_ip }}"
+  - "{{ qsfp_sriov_assignments.sglang.worker_ip1 }}"
+  - "{{ qsfp_sriov_assignments.sglang.worker_ip2 }}"
+  - "{{ qsfp_sriov_assignments.sglang.worker_ip3 }}"
+_sglang_qsfp_ips: "{{ (_sglang_qsfp_ips_sriov if qsfp_sriov_enabled | default(false) else _qsfp_ips_pf_all)[:sglang_nnodes | int] }}"
+
+_vllm_qsfp_ips_sriov:
+  - "{{ qsfp_sriov_assignments.vllm.head_ip }}"
+  - "{{ qsfp_sriov_assignments.vllm.worker_ip1 }}"
+  - "{{ qsfp_sriov_assignments.vllm.worker_ip2 }}"
+  - "{{ qsfp_sriov_assignments.vllm.worker_ip3 }}"
+_vllm_qsfp_ips: "{{ (_vllm_qsfp_ips_sriov if qsfp_sriov_enabled | default(false) else _qsfp_ips_pf_all)[:vllm_nnodes | int] }}"
+
+_sglang_shard_qsfp_ips_sriov:
+  - "{{ qsfp_sriov_assignments.sglang_shard.head_ip }}"
+  - "{{ qsfp_sriov_assignments.sglang_shard.worker_ip1 }}"
+  - "{{ qsfp_sriov_assignments.sglang_shard.worker_ip2 }}"
+  - "{{ qsfp_sriov_assignments.sglang_shard.worker_ip3 }}"
+_sglang_shard_qsfp_ips: "{{ (_sglang_shard_qsfp_ips_sriov if qsfp_sriov_enabled | default(false) else _qsfp_ips_pf_all)[:sglang_nnodes | int] }}"
+
+_vllm_shard_qsfp_ips_sriov:
+  - "{{ qsfp_sriov_assignments.vllm_shard.head_ip }}"
+  - "{{ qsfp_sriov_assignments.vllm_shard.worker_ip1 }}"
+  - "{{ qsfp_sriov_assignments.vllm_shard.worker_ip2 }}"
+  - "{{ qsfp_sriov_assignments.vllm_shard.worker_ip3 }}"
+_vllm_shard_qsfp_ips: "{{ (_vllm_shard_qsfp_ips_sriov if qsfp_sriov_enabled | default(false) else _qsfp_ips_pf_all)[:vllm_nnodes | int] }}"
+
+# HuggingFace cache paths on DGX nodes
+hf_cache_path: "/var/lib/hf-cache"
+hf_token: "hf_CHANGEME"
+# HuggingFace model pre-download Job
+hf_preload_models:
+  - "togethercomputer/Aurora-Spec-Minimax-M2.5"
+  - "lmsys/Qwen3-235B-A22B-EAGLE3"
+  - "nvidia/Qwen3-235B-A22B-Eagle3"
+  - "nvidia/Qwen3-235B-A22B-NVFP4"
+  - "nvidia/Gemma-4-31B-IT-NVFP4"
+  - "bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4"
+  - "google/gemma-4-31B-it"
+  - "google/gemma-4-26B-A4B-it"
+#  - "nvidia/Qwen3-235B-A22B-NVFP4"
+#  - "Qwen/Qwen3-235B-A22B-FP8"
+#  - "nvidia/Qwen3.5-397B-A17B-NVFP4"
+#  - "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+#  - "zai-org/GLM-4.7-FP8"
+#  - "nvidia/GLM-4.7-NVFP4"
+#  - "nvidia/MiniMax-M2.5-NVFP4"
+#  - "novita/Eagle3-Spec-Minimax-M2.5-Exp14"  # gone ?!
+#  - "togethercomputer/Aurora-Spec-Minimax-M2.5"  # request-gated
+#  - "nvidia/Qwen3.5-397B-A17B-NVFP4"
+#  - "Qwen/Qwen3.5-122B-A10B-FP8"
+#  - "nvidia/GLM-5-NVFP4"
+#  - "QuantTrio/Qwen3-235B-A22B-Thinking-2507-AWQ"
+#  - "QuantTrio/Qwen3-235B-A22B-Instruct-2507-AWQ"
+#  - "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+#  - "Qwen/Qwen3.5-35B-A3B-FP8"
+#  - "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"
+#  - "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+#  - "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+hf_preload_ttl: 3600
+# NVIDIA GPU time-slicing: advertise each physical GPU as N logical replicas
+nvidia_gpu_timeslice_replicas: 4
+
+# nsupdate DNS registration
+nsupdate_server: "198.51.100.1"
+nsupdate_zone: "example.com"
+nsupdate_tsig_key_name: "dgx.example.com"
+nsupdate_tsig_key_secret: "CHANGEME_BASE64_TSIG_KEY"
+nsupdate_tsig_algorithm: "hmac-sha256"
+nsupdate_ttl: 3600
+nsupdate_ingress_ip: "192.168.101.100"
+
+
+# ============================================================================
+# LiteLLM — OpenAI-compatible proxy aggregating multiple LLM backends.
+# Routes requests to SGLang, vLLM, and Ollama via unified API.
+# ============================================================================
+
+# Merged sampling defaults for the active SGLang model: recommended + overrides.
+# Injected into litellm_model_list via combine() so LiteLLM sends them as
+# per-request defaults (client params override these).
+_sglang_sampling_defaults: >-
+  {{ sglang_model_profiles[sglang_model].recommended_sampling | default({})
+     | combine(sglang_model_profiles[sglang_model].sampling_overrides | default({})) }}
+
+# extra_body defaults for the active SGLang model: chat_template_kwargs (reasoning
+# toggles like enable_thinking, low_effort). Passed as LiteLLM extra_body so clients
+# inherit reasoning defaults without explicit per-request config. Also flows to
+# SGLang server via --chat-template-kwargs (sglang_chat_template_kwargs) as a
+# server-side default. Per-request extra_body from clients overrides these.
+_sglang_extra_body_defaults: >-
+  {{ {'chat_template_kwargs': sglang_model_profiles[sglang_model].chat_template_kwargs}
+     if sglang_model_profiles[sglang_model].chat_template_kwargs is defined
+     else {} }}
+
+litellm_enabled: true
+litellm_namespace: "litellm"
+litellm_image: "ghcr.io/berriai/litellm:main-latest"
+litellm_port: 4000
+
+# Model list: each entry maps a model_name to a backend endpoint.
+# api_key defaults to "none" in the task template for local backends.
+# Sampling defaults are set per model here — LiteLLM passes them as request
+# defaults to the backend. Per-request params from the client override these.
+# This replaces the previous generation_config.json patching hack in launch.sh.
+litellm_model_list:
+  - model_name: "{{ sglang_served_model_name }}"
+    litellm_params:
+      model: "openai/{{ sglang_served_model_name }}"
+      api_base: "http://sglang.{{ sglang_namespace }}.svc.cluster.local:{{ sglang_port }}/v1"
+      api_key: "none"
+      # Sampling defaults from _sglang_sampling_defaults (recommended + overrides):
+      temperature: "{{ _sglang_sampling_defaults.temperature | default(omit) }}"
+      top_p: "{{ _sglang_sampling_defaults.top_p | default(omit) }}"
+      top_k: "{{ _sglang_sampling_defaults.top_k | default(omit) }}"
+      presence_penalty: "{{ _sglang_sampling_defaults.presence_penalty | default(omit) }}"
+      frequency_penalty: "{{ _sglang_sampling_defaults.frequency_penalty | default(omit) }}"
+      repetition_penalty: "{{ _sglang_sampling_defaults.repetition_penalty | default(omit) }}"
+      min_p: "{{ _sglang_sampling_defaults.min_p | default(omit) }}"
+      # Reasoning defaults from _sglang_extra_body_defaults (chat_template_kwargs):
+      extra_body: "{{ _sglang_extra_body_defaults if _sglang_extra_body_defaults else omit }}"
+
+  # Ollama models via native LiteLLM providers (ollama/ for embeddings,
+  # ollama_chat/ for chat). LiteLLM's ollama provider forces TLS on all
+  # connections — each Ollama pod runs a stunnel sidecar (self-signed cert,
+  # port {{ ollama_tls_port }}) so the native provider works over HTTPS.
+  # ssl_verify: false skips certificate verification for the self-signed cert.
+  - model_name: "{{ ollama_embed_model }}"
+    litellm_params:
+      model: "ollama/{{ ollama_embed_model }}"
+      api_base: "https://ollama-embed.ollama.svc.cluster.local:{{ ollama_tls_port }}"
+      ssl_verify: false
+  - model_name: "{{ ollama_model }}"
+    litellm_params:
+      model: "ollama_chat/{{ ollama_model }}"
+      api_base: "https://ollama.ollama.svc.cluster.local:{{ ollama_tls_port }}"
+      ssl_verify: false
+
+
+# litellm_settings: rendered as the litellm_settings block in config.yaml
+litellm_settings:
+  num_retries: 2
+  # End-to-end timeout (seconds) for the full upstream response — NOT an idle
+  # timeout. Covers the entire request lifecycle from send to final byte.
+  # Must be >= the longest backend timeout (SGLang HAProxy: {{ sglang_haproxy_timeout }}s,
+  # vLLM: no proxy, but long-running thinking requests can take minutes).
+  request_timeout: 1800
+  # drop_params: false — pass through backend-specific params (top_k, min_p,
+  # chat_template_kwargs, thinking_budget, custom logit processors, etc.)
+  # so clients can use SGLang/vLLM-native features via extra_body.
+  drop_params: false
+  # ssl_verify: false — global override for the ollama/ embedding provider bug.
+  # The ollama/ embedding codepath uses a module-level HTTP singleton that reads
+  # litellm.ssl_verify at creation time but ignores per-model ssl_verify config.
+  # This sets litellm.ssl_verify=False globally so the singleton skips cert
+  # verification for self-signed certs on our HAProxy TLS sidecars.
+  # See LITELLM_UPSTREAM_BUG.md for details.
+  ssl_verify: false
+

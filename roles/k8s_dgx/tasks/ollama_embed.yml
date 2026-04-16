@@ -1,0 +1,339 @@
+---
+- name: Create ollama namespace
+  kubernetes.core.k8s:
+    name: ollama
+    api_version: v1
+    kind: Namespace
+    state: present
+
+- name: Create ollama configmap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ollama-embed-config
+        namespace: ollama
+      data:
+        OLLAMA_MODELS: "/ollama_models"
+        OLLAMA_NUM_PARALLEL: "{{ ollama_embed_num_parallel | string }}"
+        OLLAMA_MAX_LOADED_MODELS: "{{ ollama_embed_max_loaded_models | string }}"
+        OLLAMA_KEEP_ALIVE: "{{ ollama_embed_keep_alive | string }}"
+        OLLAMA_FLASH_ATTENTION: "{{ ollama_embed_flash_attention | string }}"
+        OLLAMA_KV_CACHE_TYPE: "{{ ollama_embed_kv_cache_type }}"
+        OLLAMA_CONTEXT_LENGTH: "{{ ollama_embed_context_length | string }}"
+
+- name: Create ollama-embed pull-models script configmap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ollama-embed-pull-models-script
+        namespace: ollama
+      data:
+        pull-embed-models.sh: |
+          #!/bin/bash
+          set -em
+          ollama serve &
+          until ollama list >/dev/null 2>&1; do
+            echo "waiting for ollama to be available in initContainer..."
+            sleep 1
+          done
+          IFS=',' read -ra models <<< "$OLLAMA_EMBED_PRELOAD_MODELS"
+          for model in "${models[@]}"; do
+            echo "Pulling ${model} ..."
+            ollama pull "${model}"
+          done
+          kill %1
+
+- name: Create ollama-embed warmup script configmap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ollama-embed-warmup-script
+        namespace: ollama
+      data:
+        embed-warmup.sh: |
+          #!/bin/sh
+          set -e
+          until ollama list >/dev/null 2>&1; do
+            date
+            echo "waiting for ollama to be ready..."
+            sleep 1
+          done
+          date
+          echo "installing curl..."
+          apt-get update -qq && apt-get install -y -qq curl >/dev/null
+          echo "loading {{ ollama_embedding_model }} into memory (num_ctx={{ ollama_embedding_model_max_ctx }})..."
+          curl -sf http://localhost:11434/api/embed \
+            -d '{"model":"{{ ollama_embedding_model }}","input":"warmup","options":{"num_ctx":{{ ollama_embedding_model_max_ctx }}}}'
+          echo
+          echo "done"
+          date
+
+- name: Create ollama-embed service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ollama-embed
+        namespace: ollama
+        labels:
+          app: ollama-embed
+      spec:
+        selector:
+          app: ollama-embed
+        ports:
+          - port: "{{ ollama_port }}"
+            name: ollamaport
+            targetPort: "{{ ollama_port }}"
+          - port: "{{ ollama_tls_port }}"
+            name: tls
+            targetPort: "{{ ollama_tls_port }}"
+
+- name: Create ollama-embed deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ollama-embed
+        namespace: ollama
+        labels:
+          app: ollama-embed
+        annotations:
+          keel.sh/policy: force
+          keel.sh/match-tag: "true"
+          keel.sh/pollSchedule: "@every 24h"
+          keel.sh/trigger: poll
+      spec:
+        replicas: "{{ ollama_embed_replicas | default(1) | int }}"
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: ollama-embed
+        template:
+          metadata:
+            labels:
+              app: ollama-embed
+            annotations:
+              kubectl.kubernetes.io/default-container: ollama-embed
+              checksum/config: "{{ (ollama_embed_num_parallel | string ~ ollama_embed_max_loaded_models | string ~ ollama_embed_keep_alive | string ~ ollama_embed_flash_attention | string ~ ollama_embed_kv_cache_type ~ ollama_embed_context_length | string) | hash('sha256') }}"
+              checksum/pull-models: "{{ ollama_embed_preload_models | join(',') | hash('sha256') }}"
+              checksum/tls-haproxy: "{{ (ollama_tls_port | string ~ ollama_port | string) | hash('sha256') }}"
+          spec:
+            restartPolicy: Always
+            nodeSelector:
+              spark-id: "2"
+            dnsConfig:
+              options:
+                - name: ndots
+                  value: "1"
+            initContainers:
+              - name: pull-embed-models
+                image: ollama/ollama:latest
+                imagePullPolicy: Always
+                command: ["/bin/bash", "/scripts/pull-embed-models.sh"]
+                envFrom:
+                  - configMapRef:
+                      name: ollama-embed-config
+                env:
+                  - name: OLLAMA_EMBED_PRELOAD_MODELS
+                    value: "{{ ollama_embed_preload_models | join(',') }}"
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: ollama-embed-data
+                    mountPath: /ollama_models
+                  - name: pull-embed-models-script
+                    mountPath: /scripts
+              - name: gen-tls-cert
+                image: ollama/ollama:latest
+                command: ["/bin/sh", "/scripts-tls/gen-cert.sh"]
+                volumeMounts:
+                  - name: tls-haproxy-config
+                    mountPath: /scripts-tls/gen-cert.sh
+                    subPath: gen-cert.sh
+                    readOnly: true
+                  - name: tls-cert
+                    mountPath: /etc/haproxy/tls
+            containers:
+              - name: ollama-embed
+                image: ollama/ollama:latest
+                imagePullPolicy: Always
+                lifecycle:
+                  postStart:
+                    exec:
+                      command: ["/bin/sh", "/scripts/embed-warmup.sh"]
+                envFrom:
+                  - configMapRef:
+                      name: ollama-embed-config
+                tty: true
+                ports:
+                  - containerPort: "{{ ollama_port }}"
+                    name: ollamaport
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: ollama-embed-data
+                    mountPath: /ollama_models
+                  - name: warmup-script
+                    mountPath: /scripts
+              - name: tls-proxy
+                image: haproxy:lts-alpine
+                command: ["haproxy", "-f", "/etc/haproxy/haproxy.cfg"]
+                ports:
+                  - containerPort: "{{ ollama_tls_port }}"
+                    name: tls
+                volumeMounts:
+                  - name: tls-haproxy-config
+                    mountPath: /etc/haproxy/haproxy.cfg
+                    subPath: haproxy.cfg
+                    readOnly: true
+                  - name: tls-cert
+                    mountPath: /etc/haproxy/tls
+                    readOnly: true
+            volumes:
+              - name: ollama-embed-data
+                hostPath:
+                  path: /var/lib/ollama-embed-data
+                  type: DirectoryOrCreate
+              - name: pull-embed-models-script
+                configMap:
+                  name: ollama-embed-pull-models-script
+                  defaultMode: 0755
+              - name: warmup-script
+                configMap:
+                  name: ollama-embed-warmup-script
+                  defaultMode: 0755
+              - name: tls-haproxy-config
+                configMap:
+                  name: ollama-tls-haproxy-config
+                  defaultMode: 0755
+              - name: tls-cert
+                emptyDir: {}
+
+- name: Create ollama ip-allowlist middleware
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: ollama-ip-allowlist
+        namespace: ollama
+      spec:
+        ipAllowList:
+          sourceRange: "{{ traefik_internal_allowlist }}"
+
+- name: Create ollama http to https redirect middleware
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: redirect-myhttps
+        namespace: ollama
+      spec:
+        redirectScheme:
+          scheme: https
+
+- name: Create ollama-embed TLS certificate
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: "ollama-embed.{{ dns_external_domain_suffix }}"
+        namespace: ollama
+      spec:
+        dnsNames:
+          - "ollama-embed.{{ dns_external_domain_suffix }}"
+        secretName: "ollama-embed.{{ dns_external_domain_suffix }}"
+        issuerRef:
+          name: letsencrypt-production
+          kind: ClusterIssuer
+
+- name: Create ollama-embed http ingressroute with redirect
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: ollama-embed-ingress
+        namespace: ollama
+      spec:
+        entryPoints:
+          - web
+        routes:
+        - kind: Rule
+          match: "Host(`ollama-embed.{{ dns_external_domain_suffix }}`)"
+          priority: 10
+          services:
+          - kind: Service
+            name: ollama-embed
+            namespace: ollama
+            passHostHeader: true
+            port: "{{ ollama_port }}"
+          middlewares:
+            - name: redirect-myhttps
+            - name: ollama-ip-allowlist
+
+- name: Create ollama-embed https ingressroute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: ollama-embed-https-ingress
+        namespace: ollama
+      spec:
+        entryPoints:
+          - websecure
+        routes:
+          - kind: Rule
+            match: "Host(`ollama-embed.{{ dns_external_domain_suffix }}`)"
+            priority: 10
+            middlewares:
+              - name: ollama-ip-allowlist
+            services:
+              - kind: Service
+                name: ollama-embed
+                namespace: ollama
+                passHostHeader: true
+                port: "{{ ollama_port }}"
+        tls:
+          secretName: "ollama-embed.{{ dns_external_domain_suffix }}"
+
+- name: Register DNS A record for ollama-embed
+  community.general.nsupdate:
+    server: "{{ nsupdate_server }}"
+    zone: "{{ nsupdate_zone }}"
+    key_name: "{{ nsupdate_tsig_key_name }}"
+    key_secret: "{{ nsupdate_tsig_key_secret }}"
+    key_algorithm: "{{ nsupdate_tsig_algorithm }}"
+    record: "ollama-embed.{{ dns_external_domain_suffix }}."
+    type: A
+    ttl: "{{ nsupdate_ttl }}"
+    value: "{{ nsupdate_ingress_ip }}"
+    state: present

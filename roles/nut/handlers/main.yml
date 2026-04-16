@@ -1,0 +1,23 @@
+---
+# file: roles/nut/handlers/main.yml
+
+- name: restart nut-driver
+  service:
+    name: nut-driver@{{ nut_ups_name }}
+    state: restarted
+
+- name: restart nut-driver-secondary
+  service:
+    name: nut-driver@{{ nut_ups_secondary_name }}
+    state: restarted
+  when: nut_ups_secondary_name is defined
+
+- name: restart nut-server
+  service:
+    name: nut-server
+    state: restarted
+
+- name: restart nut-monitor
+  service:
+    name: nut-monitor
+    state: restarted

@@ -1,0 +1,141 @@
+---
+- name: Check if desktop metapackages are installed
+  ansible.builtin.shell: dpkg-query -W -f='${Package}\n' ubuntu-desktop ubuntu-desktop-minimal 2>/dev/null || true
+  register: desktop_pkgs_check
+  changed_when: false
+
+- name: Remove desktop metapackages (prevents autoremove conflicts)
+  ansible.builtin.apt:
+    name:
+      - ubuntu-desktop
+      - ubuntu-desktop-minimal
+    state: absent
+    purge: true
+  when: desktop_pkgs_check.stdout | length > 0
+
+- name: Autoremove orphaned desktop dependencies
+  ansible.builtin.apt:
+    autoremove: true
+  when: desktop_pkgs_check.stdout | length > 0
+
+- name: Check current default target
+  ansible.builtin.command: systemctl get-default
+  register: current_default_target
+  changed_when: false
+
+- name: Set default target to multi-user.target
+  ansible.builtin.command: systemctl set-default multi-user.target
+  when: current_default_target.stdout != 'multi-user.target'
+
+- name: Disable, stop and mask gdm3 service
+  ansible.builtin.systemd:
+    name: gdm3
+    state: stopped
+    enabled: false
+    masked: true
+
+- name: Disable and stop DGX dashboard services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - dgx-dashboard
+    - dgx-dashboard-admin
+    - cups
+    - cups.socket
+    - cups.path
+
+# nvidia-dgx-sol is NVIDIA's "Sign of Life" telemetry service that phones home
+# every 5 minutes. Since we block events.telemetry.data.nvidia.com via DNS, this
+# just spams "Event callback returned failure." into the journal.
+- name: Disable and stop NVIDIA DGX telemetry service
+  ansible.builtin.systemd:
+    name: nvidia-dgx-sol
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Mask PipeWire user services globally
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    masked: true
+    scope: global
+  loop:
+    - pipewire.service
+    - pipewire.socket
+    - pipewire-pulse.service
+    - pipewire-pulse.socket
+    - wireplumber.service
+  failed_when: false
+
+- name: Disable Plymouth splash screen services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+  loop:
+    - plymouth-start
+    - plymouth-read-write
+    - plymouth-quit
+    - plymouth-quit-wait
+  failed_when: false
+
+- name: Check if systemd-boot cmdline exists
+  ansible.builtin.stat:
+    path: /etc/kernel/cmdline
+  register: _kernel_cmdline_file
+
+- name: Read current kernel cmdline (systemd-boot)
+  ansible.builtin.slurp:
+    src: /etc/kernel/cmdline
+  register: _kernel_cmdline_raw
+  when: _kernel_cmdline_file.stat.exists
+
+- name: Remove splash and quiet from kernel cmdline (systemd-boot)
+  ansible.builtin.copy:
+    content: "{{ _kernel_cmdline_raw.content | b64decode | regex_replace('\\s*(splash|quiet)', '') | trim }}\n"
+    dest: /etc/kernel/cmdline
+    mode: "0644"
+  register: _kernel_cmdline_changed
+  when:
+    - _kernel_cmdline_file.stat.exists
+    - _kernel_cmdline_raw.content | b64decode is search('splash|quiet')
+
+- name: Update bootloader after cmdline change (systemd-boot)
+  ansible.builtin.command: bootctl update
+  when: _kernel_cmdline_changed is changed
+
+- name: Remove splash and quiet from GRUB config
+  ansible.builtin.lineinfile:
+    path: /etc/default/grub
+    regexp: '^GRUB_CMDLINE_LINUX_DEFAULT='
+    line: 'GRUB_CMDLINE_LINUX_DEFAULT=""'
+  register: _grub_cmdline_changed
+  when: not _kernel_cmdline_file.stat.exists
+
+- name: Update GRUB after cmdline change
+  ansible.builtin.command: update-grub
+  when: _grub_cmdline_changed is changed
+
+- name: Find active XDG autostart desktop files
+  ansible.builtin.find:
+    paths: /etc/xdg/autostart
+    patterns: "*.desktop"
+  register: _xdg_autostart_files
+
+- name: Rename XDG autostart files to .desktop.OFF
+  ansible.builtin.command: mv "{{ item.path }}" "{{ item.path }}.OFF"
+  loop: "{{ _xdg_autostart_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: _xdg_autostart_files.files | length > 0
+
+- name: Disable and stop Docker services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - docker
+    - docker.socket
+  failed_when: false

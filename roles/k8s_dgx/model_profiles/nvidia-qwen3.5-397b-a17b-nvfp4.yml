@@ -1,0 +1,74 @@
+---
+# Model profile: nvidia/Qwen3.5-397B-A17B-NVFP4
+# Loaded by include_vars in k8s_dgx role, merged into sglang_model_profiles.
+_model_profile:
+  "nvidia/Qwen3.5-397B-A17B-NVFP4":
+    info_url: "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4"
+    # 397B/17B-active MoE (512 experts, top-10, softmax routing), NVFP4 quantized (~234 GB).
+    # Architecture: Qwen3.5 MoE — hybrid attention: 15 full GQA layers + 45 linear
+    # attention layers (every 4th layer is full attention). 60 layers total,
+    # 1 shared expert + 512 routed experts per MoE layer. Multimodal (text+image+video).
+    # Has MTP head (1 layer) for speculative decoding (NEXTN).
+    # num_attention_heads=32, num_key_value_heads=2 → TP=2 max (2 KV heads).
+    # Model card says TP=4 — may work due to hybrid attention (linear heads=16/64
+    # are divisible by 4), but full-attention KV heads=2 could be a problem. Needs testing.
+    # NVFP4 quantization: only routed expert MoE FFN weights are FP4; attention,
+    # shared experts, vision encoder, lm_head, and MTP layer remain in BF16.
+    # ~234 GB / 4 GPUs ≈ ~59 GB/GPU — should fit on 4× DGX Spark.
+    # Recommended launch (NVIDIA model card):
+    #   python3 -m sglang.launch_server --model nvidia/Qwen3.5-397B-A17B-NVFP4 \
+    #     --tensor-parallel-size 4 --quantization modelopt_fp4 --trust-remote-code
+    # Note: model card does NOT specify parsers, moe_runner_backend, or attention_backend.
+    # WARNING: model_type=qwen3_5_moe may require transformers upgrade.
+    nccl_transport: "roce"
+    tp_size: 4  # model card says TP=4; num_kv_heads=2 may limit to TP=2 — needs testing
+    context_length: 196608  # model max 262144; conservative start
+    quantization: "modelopt_fp4"
+    trust_remote_code: true
+    # EP=1 TP=4 winner config (Test 38, with MTP, 2026-04-16):
+    #   Test 38: cutlass MoE + triton attn + fi_cutlass FP4 + CG on + MTP
+    #     → 40.0 / 84.3 / 110.9 tok/s (n=1 / n=4 peak / n=8 peak)
+    #   MTP speedup over non-MTP best (Test 28: 21.5/67.8/102.0):
+    #     +86% n=1, +24% n=4, +9% n=8. cutlass MoE beats triton MoE by ~13%
+    #     at n=1 with MTP (40.0 vs 35.3) — unlike without MTP where both
+    #     are within noise.
+    # See TESTLOGS/sglang_nn4_tp4_ep1/qwen-3.5-397b-a17b-nvfp4/
+    #     TESTLOG_nv580.142_sglang-0.5.10_qwen3.5-397b-nvfp4_4n.md
+    moe_runner_backend: "cutlass"
+    kv_cache_dtype: "fp8_e4m3"
+    # 0.75 with MTP: draft tokens need extra KV cache headroom.
+    # 0.80 was used without MTP but OOMs with speculative enabled.
+    mem_fraction_static: "0.75"
+    attention_backend: "triton"
+    fp4_gemm_backend: "flashinfer_cutlass"
+    jit_max_jobs: 4
+    disable_piecewise_cuda_graph: true
+    # disable_flashinfer_cutlass_moe_fp4_allgather: true
+    disable_cuda_graph: false
+    cuda_graph_max_bs: 8
+    pp_async_batch_depth: 0
+    disable_deep_gemm: true
+    # Qwen3.5 reasoning: model card doesn't specify SGLang parser.
+    # vLLM uses "qwen3". For SGLang, try "deepseek-r1" or "qwen3" if available.
+    reasoning_parser: "qwen3"
+    num_experts: 512
+    # EP=1 required: flashinfer_cutlass/triton/cutlass MoE all crash at EP>1
+    # due to the StandardDispatcher EP combine bug (see
+    # SGLANG_NVFP4_SHUFFLE_ROWS_OOB_UPSTREAM_BUG.md). At EP=1 each GPU has all
+    # 512 experts (TP-sharded intermediate), no per-layer EP all-reduce.
+    ep_size: 1
+    recommended_sampling:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+    speculative_enabled: true
+    speculative_algo: NEXTN
+    speculative_num_steps: 3
+    speculative_num_draft_tokens: 4
+    # Qwen3.5 MoE uses hybrid attention (linear + full GQA) — SGLang classifies
+    # this under its "mamba" scheduler path. MTP requires extra_buffer strategy
+    # and SGLANG_ENABLE_SPEC_V2=1, otherwise startup fails with:
+    #   "Speculative decoding for Qwen3_5MoeForConditionalGeneration is not
+    #    compatible with radix cache when using --mamba-scheduler-strategy no_buffer"
+    mamba_scheduler_strategy: "extra_buffer"
+    enable_spec_v2: true

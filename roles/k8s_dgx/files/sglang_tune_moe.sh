@@ -1,0 +1,231 @@
+#!/bin/bash
+set -e
+
+# Tune fused MoE Triton kernel configs for the current GPU.
+# SGLang logs "Using default MoE kernel config" when no GPU-specific configs exist.
+# This script runs the upstream tuning benchmark (~1280 configs per dtype/shape),
+# persists the optimal JSON to a shared hostPath, and rsyncs to spark2.
+#
+# Env vars (all from Job spec):
+#   SGLANG_MODEL        — HF model ID (e.g. Qwen/Qwen3-235B-A22B-Instruct-2507-AWQ)
+#   TP                  — tensor parallelism (e.g. 2)
+#   EP                  — expert parallelism (e.g. 2)
+#   HF_TOKEN            — HuggingFace token
+#   MOE_CONFIG_DIR      — container path for config output (e.g. /root/.cache/huggingface/moe_configs)
+#   RSYNC_TARGETS       — comma-separated IPs of worker nodes for rsync
+#   HF_CACHE_HOST_PATH  — host path for hf-cache (e.g. /var/lib/hf-cache)
+#   FORCE_RETUNE        — set "true" to overwrite existing configs
+#   SGLANG_TUNE_BRANCH  — GitHub branch for tuning scripts (default: main)
+
+echo "=== SGLang MoE Triton Kernel Tuning ==="
+echo "Model: ${SGLANG_MODEL}"
+echo "TP: ${TP}, EP: ${EP}"
+
+# 0. Patch CUTLASS BlockScaledMmaOp to support SM121 for FP4 (NVIDIA/cutlass#2800).
+for mma_py in \
+  /usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages/cutlass/cute/nvgpu/tcgen05/mma.py \
+  /usr/local/lib/python3.12/dist-packages/flashinfer/data/cutlass/python/CuTeDSL/cutlass/cute/nvgpu/tcgen05/mma.py; do
+  if [ -f "$mma_py" ] && grep -q 'admissible_archs = \[' "$mma_py" 2>/dev/null; then
+    if ! grep -q 'sm_121a' "$mma_py" 2>/dev/null; then
+      sed -i 's/Arch\.sm_100a,/Arch.sm_100a, Arch.sm_120a, Arch.sm_121a,/' "$mma_py"
+      echo "Patched mma.py: added sm_120a + sm_121a to BlockScaledMmaOp.admissible_archs"
+    fi
+  fi
+done
+
+# NOTE: nvfp4_blockwise_moe.cuh SM121 tile fix not possible via runtime patch.
+# Requires SM121-specific sgl-kernel build. Use flashinfer_cutlass MoE for NVFP4.
+
+# 1. Install tools
+apt-get update -qq && apt-get install -y -qq rsync openssh-client curl >/dev/null 2>&1
+
+# 2. Detect Triton version slug (e.g. "3.1.0" → "3_1_0")
+triton_version=$(python3 -c "import triton; print(triton.__version__)")
+triton_slug=$(echo "$triton_version" | tr '.' '_')
+echo "Triton version: ${triton_version} (slug: ${triton_slug})"
+
+# 3. Detect GPU device name (e.g. "NVIDIA GB10" → "NVIDIA_GB10")
+gpu_name=$(python3 -c "import torch; print(torch.cuda.get_device_name(0))")
+gpu_slug=$(echo "$gpu_name" | tr ' ' '_')
+echo "GPU: ${gpu_name} (slug: ${gpu_slug})"
+
+# 4. Build output path
+config_dir="${MOE_CONFIG_DIR}/configs/triton_${triton_slug}"
+mkdir -p "$config_dir"
+echo "Config output dir: ${config_dir}"
+
+# 5. Idempotency check — skip if matching JSON exists for this GPU
+existing=$(find "$config_dir" -name "*${gpu_slug}*.json" 2>/dev/null | head -1)
+if [ -n "$existing" ] && [ "$FORCE_RETUNE" != "true" ]; then
+  echo "Tuned config already exists: ${existing}"
+  echo "Set FORCE_RETUNE=true to re-run. Skipping."
+  # Still rsync existing configs
+  if [ -n "$RSYNC_TARGETS" ]; then
+    ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    IFS=',' read -ra targets <<< "$RSYNC_TARGETS"
+    for target in "${targets[@]}"; do
+      echo "Rsyncing existing configs to ${target} ..."
+      dst="root@${target}:${HF_CACHE_HOST_PATH}/moe_configs/"
+      rsync -ah -e "ssh $ssh_opts" "${MOE_CONFIG_DIR}/" "$dst"
+      echo "Rsync to ${target} complete."
+    done
+  fi
+  exit 0
+fi
+
+# 6. Download tuning scripts from SGLang GitHub
+branch="${SGLANG_TUNE_BRANCH:-main}"
+base_url="https://raw.githubusercontent.com/sgl-project/sglang/${branch}/benchmark/kernels/fused_moe_triton"
+workdir=$(mktemp -d)
+echo "Downloading tuning scripts from branch '${branch}' ..."
+curl -fsSL "${base_url}/tuning_fused_moe_triton.py" -o "${workdir}/tuning_fused_moe_triton.py"
+curl -fsSL "${base_url}/common_utils.py" -o "${workdir}/common_utils.py"
+# Create __init__.py so common_utils can be imported
+touch "${workdir}/__init__.py"
+
+# Patch: upstream get_model_config() calls config.get_text_config() which loses
+# top-level attributes (architectures, quantization_config) that only exist on
+# the multimodal config, not on the text sub-config.
+# This breaks Qwen3.5 MoE: architectures=None crash + block_shape not detected.
+# Fix: preserve both across the unwrap.
+python3 -c "
+import pathlib
+p = pathlib.Path('${workdir}/common_utils.py')
+src = p.read_text()
+old = '''    if hasattr(config, \"text_config\"):
+        config = config.get_text_config()'''
+new = '''    if hasattr(config, \"text_config\"):
+        _architectures = config.architectures
+        _quant_config = getattr(config, \"quantization_config\", None)
+        config = config.get_text_config()
+        if config.architectures is None:
+            config.architectures = _architectures
+        if not hasattr(config, \"quantization_config\") and _quant_config is not None:
+            config.quantization_config = _quant_config'''
+if old in src:
+    src = src.replace(old, new, 1)
+    p.write_text(src)
+    print('Patched common_utils.py: preserve architectures + quantization_config across text_config unwrap')
+else:
+    print('WARNING: patch target not found in common_utils.py — upstream may have fixed this')
+
+# Patch 2: config_groups with group_size=None (channel-wise FP8) sets block_shape=[0, None]
+# instead of block_shape=None. This makes the tuning script crash with 'NoneType % int'.
+# Fix: only set block_shape if group_size is not None.
+src = p.read_text()
+old2 = '''        group_size = weights_config.get(\"group_size\")
+        block_shape = [0, group_size]
+        assert len(block_shape) == 2'''
+new2 = '''        group_size = weights_config.get(\"group_size\")
+        if group_size is not None:
+            block_shape = [0, group_size]
+            assert len(block_shape) == 2'''
+if old2 in src:
+    src = src.replace(old2, new2, 1)
+    p.write_text(src)
+    print('Patched common_utils.py: skip block_shape for channel-wise quant (group_size=None)')
+else:
+    print('WARNING: group_size patch target not found — upstream may have fixed this')
+"
+
+# Patch: replace Ray tqdm progress bar with print-based progress.
+# Ray's tqdm_ray renders in the Ray dashboard, not in kubectl logs — so the
+# tuning loop appears silent. Replace with periodic prints to stdout.
+# Also adds batch_size context (which sweep, how many configs) and a summary
+# line in main() showing the full tuning plan before starting.
+python3 -c "
+import pathlib
+p = pathlib.Path('${workdir}/tuning_fused_moe_triton.py')
+src = p.read_text()
+
+# 1) Replace tqdm loop with print-based progress + batch_size header
+old_loop = '        for config in tqdm(search_space):'
+new_loop = '''        print(flush=True)
+        print(f\"--- batch_size={num_tokens}: tuning {len(search_space)} configs ---\", flush=True)
+        _total = len(search_space)
+        for _cfg_idx, config in enumerate(search_space, 1):
+            if _cfg_idx == 1 or _cfg_idx % 50 == 0 or _cfg_idx == _total:
+                _pct = _cfg_idx / _total * 100
+                _best_str = f\"best={best_time:.1f}us\" if best_time < float(\"inf\") else \"searching...\"
+                print(f\"  batch_size={num_tokens}: [{_cfg_idx}/{_total}] ({_pct:.0f}%) {_best_str}\", flush=True)'''
+if old_loop in src:
+    src = src.replace(old_loop, new_loop, 1)
+    print('Patched: replaced Ray tqdm with print progress + batch_size header')
+else:
+    print('WARNING: tqdm patch target not found — upstream may have changed the loop')
+
+# 2) Add tuning plan summary in main() before _distribute
+old_dist = '        configs = _distribute('
+new_dist = '''        print(flush=True)
+        print(f\"Tuning plan: {len(batch_sizes)} batch sizes {batch_sizes} x {len(search_space)} configs = {len(batch_sizes) * len(search_space)} total benchmarks\", flush=True)
+        configs = _distribute('''
+if old_dist in src:
+    src = src.replace(old_dist, new_dist, 1)
+    print('Patched: added tuning plan summary before _distribute')
+else:
+    print('WARNING: _distribute patch target not found')
+
+# 3) Auto-detect FP8 from quantization_config when --dtype auto
+# Per-channel FP8 models (quant_method='fp8' without weight_block_size)
+# aren't detected by --dtype auto: all use_* flags stay False, so the
+# tuned config filename omits dtype=fp8_w8a8 and SGLang can't find it.
+old_fp8 = '    per_channel_quant = args.per_channel_quant'
+new_fp8 = '''    per_channel_quant = args.per_channel_quant
+    # Auto-detect FP8 from model quantization_config when --dtype auto
+    if args.dtype == \"auto\":
+        from sglang.srt.utils.hf_transformers_utils import get_config as _get_cfg
+        _cfg = _get_cfg(args.model, trust_remote_code=True)
+        _qcfg = getattr(_cfg, \"quantization_config\", None)
+        if isinstance(_qcfg, dict) and _qcfg.get(\"quant_method\") == \"fp8\":
+            use_fp8_w8a8 = True'''
+if old_fp8 in src:
+    src = src.replace(old_fp8, new_fp8, 1)
+    print('Patched: auto-detect FP8 from quantization_config when --dtype auto')
+else:
+    print('WARNING: FP8 auto-detect patch target not found — upstream may handle this now')
+
+p.write_text(src)
+"
+
+echo "Scripts downloaded to ${workdir}"
+
+# 7. Run the tuning benchmark
+# --dtype auto: relies on get_model_config() for block_shape detection, plus
+# Patch 3 in tuning_fused_moe_triton.py for FP8 auto-detection via
+# quantization_config.quant_method. Without Patch 3, per-channel FP8 models
+# (quant_method="fp8" without weight_block_size) are tuned as BF16 and the
+# config filename omits dtype=fp8_w8a8 — SGLang can't find it at runtime.
+echo "Starting MoE kernel tuning (this may take 30-90 minutes) ..."
+cd "$workdir"
+python3 tuning_fused_moe_triton.py \
+  --model "$SGLANG_MODEL" \
+  --tp-size "$TP" \
+  --ep-size "$EP" \
+  --dtype auto \
+  --tune
+echo "Tuning complete."
+
+# 8. Move generated JSON configs to persistent config dir
+# The tuning script writes JSON files to the current directory
+for f in *.json; do
+  [ -f "$f" ] || continue
+  echo "Moving ${f} → ${config_dir}/"
+  mv "$f" "${config_dir}/"
+done
+
+echo "Configs in ${config_dir}:"
+ls -la "${config_dir}/"
+
+# 9. Rsync config dir to all worker nodes via SSH
+if [ -n "$RSYNC_TARGETS" ]; then
+  ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+  IFS=',' read -ra targets <<< "$RSYNC_TARGETS"
+  for target in "${targets[@]}"; do
+    echo "Rsyncing configs to ${target} ..."
+    dst="root@${target}:${HF_CACHE_HOST_PATH}/moe_configs/"
+    rsync -ah -e "ssh $ssh_opts" "${MOE_CONFIG_DIR}/" "$dst"
+    echo "Rsync to ${target} complete."
+  done
+fi
+
+echo "=== MoE Triton Kernel Tuning Job Done ==="

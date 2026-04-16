@@ -1,0 +1,526 @@
+---
+- name: Create vLLM ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: vllm-config
+        namespace: "{{ vllm_namespace }}"
+      data:
+        VLLM_MODEL: "{{ vllm_model }}"
+        VLLM_CONTEXT_LENGTH: "{{ vllm_context_length | string }}"
+        VLLM_KV_CACHE_DTYPE: "{{ vllm_kv_cache_dtype }}"
+        VLLM_MEM_FRACTION: "{{ vllm_mem_fraction }}"
+        VLLM_REASONING_PARSER: "{{ vllm_reasoning_parser }}"
+        VLLM_TOOL_CALL_PARSER: "{{ vllm_tool_call_parser }}"
+        VLLM_QUANTIZATION: "{{ vllm_quantization }}"
+        VLLM_LOAD_FORMAT: "{{ vllm_load_format }}"
+        VLLM_MAX_NUM_SEQS: "{{ vllm_max_num_seqs | string }}"
+        VLLM_DIST_TIMEOUT: "{{ vllm_dist_timeout | string }}"
+        VLLM_SERVED_MODEL_NAME: "{{ vllm_served_model_name }}"
+        VLLM_ENFORCE_EAGER: "{{ vllm_enforce_eager | string | lower }}"
+        VLLM_ENABLE_EP: "{{ vllm_enable_ep | string | lower }}"
+        VLLM_CHAT_TEMPLATE_KWARGS: "{{ vllm_chat_template_kwargs | to_json }}"
+        # Fix CUDA allocator fragmentation during AWQ Marlin repack
+        PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+        NCCL_SOCKET_IFNAME: "{{ nccl_socket_ifname }}"
+        NCCL_IB_DISABLE: "1"
+        NCCL_DEBUG: "INFO"
+
+- name: Create vLLM launch script ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: vllm-launch-script
+        namespace: "{{ vllm_namespace }}"
+      data:
+        launch.sh: "{{ lookup('file', role_path ~ '/files/vllm_launch.sh') }}"
+
+- name: Create model-download script ConfigMap in vllm namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: sglang-model-download-script
+        namespace: "{{ vllm_namespace }}"
+      data:
+        download_models.py: "{{ lookup('file', role_path ~ '/files/hf_preload_download.py') }}"
+
+- name: Create wait-for-worker script ConfigMap in vllm namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: sglang-wait-script
+        namespace: "{{ vllm_namespace }}"
+      data:
+        wait_for_worker.sh: "{{ lookup('file', role_path ~ '/files/sglang_wait_for_worker.sh') }}"
+
+- name: Create vLLM ServiceAccount
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: sglang-head
+        namespace: "{{ vllm_namespace }}"
+
+- name: Create vLLM pod-reader Role
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: pod-reader
+        namespace: "{{ vllm_namespace }}"
+      rules:
+        - apiGroups: [""]
+          resources: ["pods"]
+          verbs: ["get", "list", "watch"]
+
+- name: Create vLLM RoleBinding
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: vllm-head-pod-reader
+        namespace: "{{ vllm_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: pod-reader
+      subjects:
+        - kind: ServiceAccount
+          name: sglang-head
+          namespace: "{{ vllm_namespace }}"
+
+# Startup ordering: Workers MUST be deployed before head.
+# At the NCCL/PyTorch level, the head (rank 0) hosts the TCP rendezvous server
+# and workers (rank 1..N) connect as clients with exponential backoff retries.
+# However, the head has a startupProbe on /v1/models which only passes after the
+# model is fully loaded — and model loading requires ALL nodes to be connected
+# (tensor parallelism). If workers waited for the head to be Ready, it would
+# deadlock: head can't become Ready without workers, workers won't start without
+# the head. Instead, workers start first (no readinessProbe → immediately Ready),
+# and the head's wait-for-worker initContainer gates on that. When the head's vllm
+# process opens the rendezvous port, the workers (already retrying) connect instantly.
+
+# Migration: remove old unnumbered vllm-worker Deployment
+- name: Remove legacy vllm-worker Deployment (pre-multi-worker)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: apps/v1
+    kind: Deployment
+    name: vllm-worker
+    namespace: "{{ vllm_namespace }}"
+
+# Cleanup: remove worker Deployments beyond current nnodes
+- name: Remove excess vLLM worker Deployments
+  kubernetes.core.k8s:
+    state: absent
+    api_version: apps/v1
+    kind: Deployment
+    name: "vllm-worker-{{ item }}"
+    namespace: "{{ vllm_namespace }}"
+  loop: "{{ range(vllm_nnodes | int, 5) | list }}"
+
+- name: Deploy vLLM worker Deployments
+  loop: "{{ range(1, vllm_nnodes | int) | list }}"
+  loop_control:
+    loop_var: worker_rank
+    label: "vllm-worker-{{ worker_rank }} (spark{{ worker_rank + 1 }}, rank {{ worker_rank }})"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "vllm-worker-{{ worker_rank }}"
+        namespace: "{{ vllm_namespace }}"
+        labels:
+          app: vllm
+          role: worker
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: vllm
+            role: worker
+            worker-rank: "{{ worker_rank | string }}"
+        template:
+          metadata:
+            labels:
+              app: vllm
+              role: worker
+              worker-rank: "{{ worker_rank | string }}"
+            annotations:
+              k8s.v1.cni.cncf.io/networks: "{{ '[{\"name\":\"qsfp-vf' ~ qsfp_sriov_assignments.vllm.vf ~ '\",\"ips\":[\"' ~ _vllm_qsfp_ips[worker_rank] ~ '/24\"]}]' if qsfp_sriov_enabled | default(false) else 'qsfp-direct-worker' ~ worker_rank }}"
+              kubectl.kubernetes.io/default-container: vllm
+              checksum/launch-script: "{{ lookup('file', role_path ~ '/files/vllm_launch.sh') | hash('sha256') }}"
+              checksum/config: "{{ (vllm_model ~ vllm_context_length ~ vllm_kv_cache_dtype ~ vllm_mem_fraction ~ vllm_quantization ~ vllm_load_format ~ (vllm_enable_ep | string)) | hash('sha256') }}"
+          spec:
+            enableServiceLinks: false         # prevent K8s VLLM_PORT=tcp://... injection
+            hostIPC: true                    # Shared Memory für NCCL
+            nodeSelector:
+              spark-id: "{{ (worker_rank + 1) | string }}"
+            initContainers:
+              - name: model-download
+                image: "{{ vllm_image }}"
+                command: ["python3", "/scripts/download_models.py"]
+                env:
+                  - name: HF_PRELOAD_MODELS
+                    value: "{{ vllm_model }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                  - name: HF_HUB_DISABLE_PROGRESS_BARS
+                    value: "0"
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: model-download-script
+                    mountPath: /scripts
+                    readOnly: true
+            containers:
+              - name: vllm
+                image: "{{ vllm_image }}"
+                command: ["/bin/bash", "/scripts/launch.sh"]
+                envFrom:
+                  - configMapRef:
+                      name: vllm-config
+                env:
+                  - name: NODE_RANK
+                    value: "{{ worker_rank | string }}"
+                  - name: VLLM_HOST
+                    valueFrom:
+                      fieldRef:
+                        fieldPath: status.podIP
+                  - name: TP
+                    value: "{{ vllm_tp | string }}"
+                  - name: NNODES
+                    value: "{{ vllm_nnodes | string }}"
+                  - name: QSFP_IP_SPARK1
+                    value: "{{ _vllm_qsfp_ips[0] }}"
+                  - name: QSFP_PEER_IPS
+                    value: "{{ (_vllm_qsfp_ips[:worker_rank] + _vllm_qsfp_ips[worker_rank + 1:]) | join(',') }}"
+                  - name: NCCL_PORT
+                    value: "{{ nccl_bootstrap_port | string }}"
+                  - name: VLLM_PORT
+                    value: "{{ vllm_port | string }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                securityContext:
+                  privileged: true
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: "{{ vllm_port }}"
+                  initialDelaySeconds: 900
+                  periodSeconds: 30
+                  failureThreshold: 3
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: launch-script
+                    mountPath: /scripts
+                    readOnly: true
+            volumes:
+              - name: hf-cache
+                hostPath:
+                  path: "{{ hf_cache_path }}"
+                  type: DirectoryOrCreate
+              - name: model-download-script
+                configMap:
+                  name: sglang-model-download-script
+              - name: launch-script
+                configMap:
+                  name: vllm-launch-script
+                  defaultMode: 0755
+
+- name: Deploy vLLM head Deployment
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: vllm-head
+        namespace: "{{ vllm_namespace }}"
+        labels:
+          app: vllm
+          role: head
+      spec:
+        replicas: 1
+        strategy:
+          type: Recreate
+        selector:
+          matchLabels:
+            app: vllm
+            role: head
+        template:
+          metadata:
+            labels:
+              app: vllm
+              role: head
+            annotations:
+              k8s.v1.cni.cncf.io/networks: "{{ '[{\"name\":\"qsfp-vf' ~ qsfp_sriov_assignments.vllm.vf ~ '\",\"ips\":[\"' ~ qsfp_sriov_assignments.vllm.head_ip ~ '/24\"]}]' if qsfp_sriov_enabled | default(false) else 'qsfp-direct' }}"
+              kubectl.kubernetes.io/default-container: vllm
+              checksum/launch-script: "{{ lookup('file', role_path ~ '/files/vllm_launch.sh') | hash('sha256') }}"
+              checksum/config: "{{ (vllm_model ~ vllm_context_length ~ vllm_kv_cache_dtype ~ vllm_mem_fraction ~ vllm_quantization ~ vllm_load_format ~ (vllm_enable_ep | string)) | hash('sha256') }}"
+          spec:
+            serviceAccountName: sglang-head
+            enableServiceLinks: false         # prevent K8s VLLM_PORT=tcp://... injection
+            hostIPC: true                    # Shared Memory für NCCL
+            nodeSelector:
+              spark-id: "1"
+            initContainers:
+              - name: model-download
+                image: "{{ vllm_image }}"
+                command: ["python3", "/scripts/download_models.py"]
+                env:
+                  - name: HF_PRELOAD_MODELS
+                    value: "{{ vllm_model }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                  - name: HF_HUB_DISABLE_PROGRESS_BARS
+                    value: "0"
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: model-download-script
+                    mountPath: /scripts
+                    readOnly: true
+              - name: wait-for-worker
+                image: bitnami/kubectl:latest
+                command: ["/bin/sh", "/scripts/wait_for_worker.sh"]
+                env:
+                  - name: WAIT_NAMESPACE
+                    value: "{{ vllm_namespace }}"
+                  - name: WAIT_LABEL
+                    value: "app=vllm,role=worker"
+                  - name: WAIT_COUNT
+                    value: "{{ ((vllm_nnodes | int) - 1) | string }}"
+                  - name: WAIT_TIMEOUT
+                    value: "{{ vllm_wait_timeout | string }}"
+                volumeMounts:
+                  - name: wait-script
+                    mountPath: /scripts
+                    readOnly: true
+            containers:
+              - name: vllm
+                image: "{{ vllm_image }}"
+                command: ["/bin/bash", "/scripts/launch.sh"]
+                envFrom:
+                  - configMapRef:
+                      name: vllm-config
+                env:
+                  - name: NODE_RANK
+                    value: "0"
+                  - name: TP
+                    value: "{{ vllm_tp | string }}"
+                  - name: NNODES
+                    value: "{{ vllm_nnodes | string }}"
+                  - name: QSFP_IP_SPARK1
+                    value: "{{ _vllm_qsfp_ips[0] }}"
+                  - name: QSFP_PEER_IPS
+                    value: "{{ _vllm_qsfp_ips[1:] | join(',') }}"
+                  - name: NCCL_PORT
+                    value: "{{ nccl_bootstrap_port | string }}"
+                  - name: VLLM_PORT
+                    value: "{{ vllm_port | string }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                securityContext:
+                  privileged: true
+                startupProbe:
+                  httpGet:
+                    path: /v1/models
+                    port: "{{ vllm_port }}"
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                  failureThreshold: 120
+                readinessProbe:
+                  httpGet:
+                    path: /v1/models
+                    port: "{{ vllm_port }}"
+                  periodSeconds: 15
+                livenessProbe:
+                  httpGet:
+                    path: /v1/models
+                    port: "{{ vllm_port }}"
+                  periodSeconds: 30
+                  failureThreshold: 3
+                ports:
+                  - containerPort: "{{ vllm_port }}"
+                    name: http
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: launch-script
+                    mountPath: /scripts
+                    readOnly: true
+            volumes:
+              - name: hf-cache
+                hostPath:
+                  path: "{{ hf_cache_path }}"
+                  type: DirectoryOrCreate
+              - name: model-download-script
+                configMap:
+                  name: sglang-model-download-script
+              - name: launch-script
+                configMap:
+                  name: vllm-launch-script
+                  defaultMode: 0755
+              - name: wait-script
+                configMap:
+                  name: sglang-wait-script
+                  defaultMode: 0755
+
+- name: Create vLLM Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: vllm
+        namespace: "{{ vllm_namespace }}"
+      spec:
+        type: ClusterIP
+        selector:
+          app: vllm
+          role: head
+        ports:
+          - name: http
+            port: "{{ vllm_port }}"
+            targetPort: "{{ vllm_port }}"
+            protocol: TCP
+
+- name: Create HTTPS redirect middleware in vllm namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: redirect-myhttps
+        namespace: "{{ vllm_namespace }}"
+      spec:
+        redirectScheme:
+          scheme: https
+
+- name: Create vLLM ip allowlist middleware
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: Middleware
+      metadata:
+        name: vllm-ip-allowlist
+        namespace: "{{ vllm_namespace }}"
+      spec:
+        ipAllowList:
+          sourceRange: "{{ traefik_internal_allowlist }}"
+
+- name: Create vLLM TLS certificate
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+      metadata:
+        name: "vllm.{{ dns_external_domain_suffix }}"
+        namespace: "{{ vllm_namespace }}"
+      spec:
+        dnsNames:
+          - "vllm.{{ dns_external_domain_suffix }}"
+        secretName: "vllm.{{ dns_external_domain_suffix }}"
+        issuerRef:
+          name: letsencrypt-production
+          kind: ClusterIssuer
+
+- name: Create vLLM http ingressroute with redirect
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: vllm-ingress
+        namespace: "{{ vllm_namespace }}"
+      spec:
+        entryPoints:
+          - web
+        routes:
+        - kind: Rule
+          match: "Host(`vllm.{{ dns_external_domain_suffix }}`)"
+          priority: 10
+          services:
+          - kind: Service
+            name: vllm
+            namespace: "{{ vllm_namespace }}"
+            passHostHeader: true
+            port: "{{ vllm_port }}"
+          middlewares:
+            - name: redirect-myhttps
+            - name: vllm-ip-allowlist
+
+- name: Create vLLM https ingressroute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: traefik.io/v1alpha1
+      kind: IngressRoute
+      metadata:
+        name: vllm-https-ingress
+        namespace: "{{ vllm_namespace }}"
+      spec:
+        entryPoints:
+          - websecure
+        routes:
+          - kind: Rule
+            match: "Host(`vllm.{{ dns_external_domain_suffix }}`)"
+            priority: 10
+            middlewares:
+              - name: vllm-ip-allowlist
+            services:
+              - kind: Service
+                name: vllm
+                namespace: "{{ vllm_namespace }}"
+                passHostHeader: true
+                port: "{{ vllm_port }}"
+        tls:
+          secretName: "vllm.{{ dns_external_domain_suffix }}"
+
+- name: Register DNS A record for vllm
+  community.general.nsupdate:
+    server: "{{ nsupdate_server }}"
+    zone: "{{ nsupdate_zone }}"
+    key_name: "{{ nsupdate_tsig_key_name }}"
+    key_secret: "{{ nsupdate_tsig_key_secret }}"
+    key_algorithm: "{{ nsupdate_tsig_algorithm }}"
+    record: "vllm.{{ dns_external_domain_suffix }}."
+    type: A
+    ttl: "{{ nsupdate_ttl }}"
+    value: "{{ nsupdate_ingress_ip }}"
+    state: present

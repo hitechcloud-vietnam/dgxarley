@@ -1,0 +1,309 @@
+---
+# Pre-shard the active vLLM model for fast multi-node TP loading.
+# Runs as a multi-node job (worker + head), same topology as vLLM itself.
+# Each node saves its own TP rank's sharded weights locally.
+#
+# Usage:
+#   ansible-playbook k8s_dgx.yml --tags vllm_shard
+#
+# Prerequisites:
+# - Model must be downloaded (run hf_preload first)
+# - Ollama pods should be scaled to 0 (the Job needs full GPU memory)
+# - After completion, set load_format: "sharded_state" in the model profile
+
+- name: Skip shard job — load_format is not sharded_state
+  ansible.builtin.debug:
+    msg: >-
+      Shard job skipped: vllm_load_format={{ vllm_load_format }}.
+      Set load_format: "sharded_state" in the model profile for
+      {{ vllm_model }} to enable sharding.
+  when: vllm_load_format != "sharded_state"
+
+- name: Create vLLM shard script ConfigMap
+  when: vllm_load_format == "sharded_state"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: vllm-shard-script
+        namespace: "{{ vllm_namespace }}"
+      data:
+        save_sharded.py: "{{ lookup('file', role_path ~ '/files/vllm_save_sharded.py') }}"
+        launch.sh: "{{ lookup('file', role_path ~ '/files/vllm_shard_launch.sh') }}"
+
+- name: Create SGLang wait-for-worker script ConfigMap
+  when: vllm_load_format == "sharded_state"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: sglang-wait-script
+        namespace: "{{ vllm_namespace }}"
+      data:
+        wait_for_worker.sh: "{{ lookup('file', role_path ~ '/files/sglang_wait_for_worker.sh') }}"
+
+- name: Delete existing vLLM shard Jobs
+  when: vllm_load_format == "sharded_state"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: "{{ item }}"
+    namespace: "{{ vllm_namespace }}"
+  loop: >-
+    {{ ['vllm-shard-worker', 'vllm-shard-head'] +
+       (range(1, vllm_nnodes | int) | map('string') | map('regex_replace', '^(.+)$', 'vllm-shard-worker-\1') | list) }}
+
+# Workers must start first (same ordering as vLLM deployment).
+# The head's NCCL rendezvous needs all workers to be reachable.
+- name: Deploy vLLM shard worker Jobs
+  when: vllm_load_format == "sharded_state"
+  loop: "{{ range(1, vllm_nnodes | int) | list }}"
+  loop_control:
+    loop_var: worker_rank
+    label: "vllm-shard-worker-{{ worker_rank }} (spark{{ worker_rank + 1 }}, rank {{ worker_rank }})"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: "vllm-shard-worker-{{ worker_rank }}"
+        namespace: "{{ vllm_namespace }}"
+        labels:
+          app: vllm-shard
+          role: worker
+      spec:
+        ttlSecondsAfterFinished: 3600
+        backoffLimit: 0
+        template:
+          metadata:
+            labels:
+              app: vllm-shard
+              role: worker
+              worker-rank: "{{ worker_rank | string }}"
+            annotations:
+              k8s.v1.cni.cncf.io/networks: "{{ '[{\"name\":\"qsfp-vf' ~ qsfp_sriov_assignments.vllm_shard.vf ~ '\",\"ips\":[\"' ~ _vllm_shard_qsfp_ips[worker_rank] ~ '/24\"]}]' if qsfp_sriov_enabled | default(false) else 'qsfp-direct-worker' ~ worker_rank }}"
+          spec:
+            serviceAccountName: sglang-head
+            enableServiceLinks: false
+            hostIPC: true
+            nodeSelector:
+              spark-id: "{{ (worker_rank + 1) | string }}"
+            restartPolicy: Never
+            initContainers:
+              - name: model-download
+                image: "{{ vllm_image }}"
+                command: ["python3", "/scripts/download_models.py"]
+                env:
+                  - name: HF_PRELOAD_MODELS
+                    value: "{{ vllm_model }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                  - name: HF_HUB_DISABLE_PROGRESS_BARS
+                    value: "0"
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: preload-script
+                    mountPath: /scripts
+                    readOnly: true
+            containers:
+              - name: shard
+                image: "{{ vllm_image }}"
+                command: ["/bin/bash", "/scripts/launch.sh"]
+                env:
+                  - name: NODE_RANK
+                    value: "{{ worker_rank | string }}"
+                  - name: TP
+                    value: "{{ vllm_tp | string }}"
+                  - name: EP
+                    value: "{{ (sglang_model_profiles[vllm_model].ep_size | default(1)) | string }}"
+                  - name: NNODES
+                    value: "{{ vllm_nnodes | string }}"
+                  - name: VLLM_MODEL
+                    value: "{{ vllm_model }}"
+                  - name: VLLM_QUANTIZATION
+                    value: "{{ vllm_quantization }}"
+                  - name: QSFP_IP_SPARK1
+                    value: "{{ _vllm_shard_qsfp_ips[0] }}"
+                  - name: QSFP_PEER_IPS
+                    value: "{{ (_vllm_shard_qsfp_ips[:worker_rank] + _vllm_shard_qsfp_ips[worker_rank + 1:]) | join(',') }}"
+                  - name: NCCL_PORT
+                    value: "{{ nccl_bootstrap_port | string }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                  - name: SGLANG_ENABLE_JIT_DEEPGEMM
+                    value: "false"
+                  - name: PYTORCH_CUDA_ALLOC_CONF
+                    value: "expandable_segments:True"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "{{ nccl_socket_ifname }}"
+                  - name: NCCL_IB_DISABLE
+                    value: "1"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: shard-script
+                    mountPath: /scripts
+                    readOnly: true
+            volumes:
+              - name: hf-cache
+                hostPath:
+                  path: "{{ hf_cache_path }}"
+                  type: DirectoryOrCreate
+              - name: preload-script
+                configMap:
+                  name: sglang-model-download-script
+              - name: shard-script
+                configMap:
+                  name: vllm-shard-script
+                  defaultMode: 0755
+
+- name: Deploy vLLM shard head Job
+  when: vllm_load_format == "sharded_state"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: vllm-shard-head
+        namespace: "{{ vllm_namespace }}"
+        labels:
+          app: vllm-shard
+          role: head
+      spec:
+        ttlSecondsAfterFinished: 3600
+        backoffLimit: 0
+        template:
+          metadata:
+            labels:
+              app: vllm-shard
+              role: head
+            annotations:
+              k8s.v1.cni.cncf.io/networks: "{{ '[{\"name\":\"qsfp-vf' ~ qsfp_sriov_assignments.vllm_shard.vf ~ '\",\"ips\":[\"' ~ qsfp_sriov_assignments.vllm_shard.head_ip ~ '/24\"]}]' if qsfp_sriov_enabled | default(false) else 'qsfp-direct' }}"
+          spec:
+            serviceAccountName: sglang-head
+            enableServiceLinks: false
+            hostIPC: true
+            nodeSelector:
+              spark-id: "1"
+            restartPolicy: Never
+            initContainers:
+              - name: model-download
+                image: "{{ vllm_image }}"
+                command: ["python3", "/scripts/download_models.py"]
+                env:
+                  - name: HF_PRELOAD_MODELS
+                    value: "{{ vllm_model }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                  - name: HF_HUB_DISABLE_PROGRESS_BARS
+                    value: "0"
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: preload-script
+                    mountPath: /scripts
+                    readOnly: true
+              - name: wait-for-worker
+                image: bitnami/kubectl:latest
+                command: ["/bin/sh", "/scripts/wait_for_worker.sh"]
+                env:
+                  - name: WAIT_NAMESPACE
+                    value: "{{ vllm_namespace }}"
+                  - name: WAIT_LABEL
+                    value: "app=vllm-shard,role=worker"
+                  - name: WAIT_COUNT
+                    value: "{{ ((vllm_nnodes | int) - 1) | string }}"
+                  - name: WAIT_TIMEOUT
+                    value: "{{ vllm_wait_timeout | string }}"
+                volumeMounts:
+                  - name: wait-script
+                    mountPath: /scripts
+                    readOnly: true
+            containers:
+              - name: shard
+                image: "{{ vllm_image }}"
+                command: ["/bin/bash", "/scripts/launch.sh"]
+                env:
+                  - name: NODE_RANK
+                    value: "0"
+                  - name: TP
+                    value: "{{ vllm_tp | string }}"
+                  - name: EP
+                    value: "{{ (sglang_model_profiles[vllm_model].ep_size | default(1)) | string }}"
+                  - name: NNODES
+                    value: "{{ vllm_nnodes | string }}"
+                  - name: VLLM_MODEL
+                    value: "{{ vllm_model }}"
+                  - name: VLLM_QUANTIZATION
+                    value: "{{ vllm_quantization }}"
+                  - name: QSFP_IP_SPARK1
+                    value: "{{ _vllm_shard_qsfp_ips[0] }}"
+                  - name: QSFP_PEER_IPS
+                    value: "{{ _vllm_shard_qsfp_ips[1:] | join(',') }}"
+                  - name: NCCL_PORT
+                    value: "{{ nccl_bootstrap_port | string }}"
+                  - name: HF_TOKEN
+                    value: "{{ hf_token }}"
+                  - name: SGLANG_ENABLE_JIT_DEEPGEMM
+                    value: "false"
+                  - name: PYTORCH_CUDA_ALLOC_CONF
+                    value: "expandable_segments:True"
+                  - name: NCCL_SOCKET_IFNAME
+                    value: "{{ nccl_socket_ifname }}"
+                  - name: NCCL_IB_DISABLE
+                    value: "1"
+                  - name: NCCL_DEBUG
+                    value: "INFO"
+                  - name: RSYNC_TARGETS
+                    value: "{{ range(2, vllm_nnodes | int + 1) | map('string') | map('regex_replace', '^(.+)$', 'spark\\1') | map('extract', hostvars, 'ansible_host') | join(',') }}"
+                  - name: HF_CACHE_HOST_PATH
+                    value: "{{ hf_cache_path }}"
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                securityContext:
+                  privileged: true
+                volumeMounts:
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                  - name: shard-script
+                    mountPath: /scripts
+                    readOnly: true
+                  - name: ssh-keys
+                    mountPath: /root/.ssh
+                    readOnly: true
+            volumes:
+              - name: hf-cache
+                hostPath:
+                  path: "{{ hf_cache_path }}"
+                  type: DirectoryOrCreate
+              - name: preload-script
+                configMap:
+                  name: sglang-model-download-script
+              - name: shard-script
+                configMap:
+                  name: vllm-shard-script
+                  defaultMode: 0755
+              - name: wait-script
+                configMap:
+                  name: sglang-wait-script
+                  defaultMode: 0755
+              - name: ssh-keys
+                hostPath:
+                  path: /root/.ssh
+                  type: Directory

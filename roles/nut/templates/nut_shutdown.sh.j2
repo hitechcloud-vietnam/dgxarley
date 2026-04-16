@@ -1,0 +1,24 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# SHUTDOWNCMD — called by upsmon when the UPS powering this host ({{ nut_ups_powers_self }})
+# reaches critical battery. Drains mapped K8s nodes, shuts down mapped hosts,
+# then powers off the local host.
+set -euo pipefail
+
+logger -t nut-shutdown "SHUTDOWNCMD — {{ nut_ups_powers_self }} critical, initiating shutdown sequence"
+
+{% set self_targets = nut_ups_shutdown_map.get(nut_ups_powers_self, {}) %}
+{% for node in self_targets.get('drain_nodes', []) %}
+kubectl drain {{ node }} --ignore-daemonsets --delete-emptydir-data --timeout=60s 2>&1 | logger -t nut-shutdown || true
+{% endfor %}
+{% if self_targets.get('drain_nodes', []) %}
+
+sleep 5
+
+{% endif %}
+{% for host in self_targets.get('ssh_hosts', []) %}
+ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@{{ host }} 'shutdown -h now' 2>&1 | logger -t nut-shutdown || true
+{% endfor %}
+
+logger -t nut-shutdown "Powering off local host"
+/sbin/shutdown -h +0

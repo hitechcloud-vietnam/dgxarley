@@ -1,0 +1,38 @@
+---
+qsfp_mtu: 9000
+qsfp_interfaces:
+  - "enp1s0f0np0"
+  - "enp1s0f1np1"
+  - "enP2p1s0f0np0"
+  - "enP2p1s0f1np1"
+# SR-IOV: create Virtual Functions on the QSFP PF used by Multus
+# When enabled, pods get VFs instead of the raw PF — allows multiple pods on QSFP.
+# qsfp_sriov_enabled lives in group_vars/all/main.yml (shared with k8s_dgx)
+qsfp_sriov_numvfs: 8
+qsfp_sriov_pf_pci: "0000:01:00.0"
+qsfp_sriov_pf_iface: "enp1s0f0np0"
+# qsfp_sriov_vf_prefix lives in group_vars/all/main.yml (shared with k8s_dgx)
+
+# Manual DCBX/PFC — only if switch DCBX auto-negotiation doesn't work
+set_dcbx_manually: false
+qsfp_dcbx_roce_tc: 3
+
+memlock_limit: "unlimited"
+stack_limit: 67108864
+
+# CPU idle management: when true, disable all C-states via cpupower (legacy
+# NCCL-socket-era tuning). Default false — kernel idle governor handles C-states,
+# which is fine since NCCL bulk traffic runs over RoCE and bypasses the CPU.
+disablecpuidlemanagement: false
+nvidia_cdi_output: "/etc/cdi/nvidia.yaml"
+# Check latest: curl -s https://api.github.com/repos/containernetworking/plugins/releases/latest | jq -r .tag_name
+cni_plugins_version: "1.9.1"
+cni_extra_plugins:
+  - host-device
+  - static
+pytorch_venv_path: "/root/pytorch-env"
+pytorch_index_url: "https://download.pytorch.org/whl/cu130"
+pytorch_packages:
+  - torch
+  - torchvision
+  - torchaudio

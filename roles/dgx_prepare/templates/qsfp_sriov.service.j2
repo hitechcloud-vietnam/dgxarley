@@ -1,0 +1,15 @@
+# Managed by Ansible — do not edit
+[Unit]
+Description=Enable {{ qsfp_sriov_numvfs }} SR-IOV VFs on QSFP PF {{ qsfp_sriov_pf_pci }}
+DefaultDependencies=no
+Before=network-pre.target
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'echo {{ qsfp_sriov_numvfs }} > /sys/bus/pci/devices/{{ qsfp_sriov_pf_pci }}/sriov_numvfs'
+ExecStop=/bin/bash -c 'echo 0 > /sys/bus/pci/devices/{{ qsfp_sriov_pf_pci }}/sriov_numvfs'
+
+[Install]
+WantedBy=multi-user.target
