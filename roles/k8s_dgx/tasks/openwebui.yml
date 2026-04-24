@@ -177,12 +177,11 @@
               "docling_server_url": "{{ openwebui_docling_server_url }}",
               "template": "Use the following context as your learned knowledge, inside <context></context> XML tags.\n<context>\n    [context]\n</context>\n\nWhen answer to user:\n- If you don't know, just say that you don't know.\n- If you don't know when you are not sure, ask for clarification.\nAvoid mentioning that you obtained the information from the context.\nAnd answer according to the language of the user's question.\n\nGiven the context information, answer the query.\nQuery: [query]",
               "ollama": {
-                "url": "{{ openwebui_embedding_ollama_url }}"
+                "url": "{{ openwebui_embedding_ollama_url }}",
+                "key": ""
               },
-              "openai": {
-                "url": "{{ openwebui_embedding_openai_url | default('') }}",
-                "key": "{{ openwebui_embedding_openai_key | default('') }}"
-              },
+              "openai_api_base_url": "{{ openwebui_embedding_openai_url | default('') }}",
+              "openai_api_key": "{{ openwebui_embedding_openai_key | default('') }}",
               "web": {
                 "search": {
                   "enable": true,
@@ -207,16 +206,16 @@
     api_version: v1
     kind: "{{ item.kind }}"
     name: "{{ item.name }}"
-    namespace: ollama
+    namespace: "{{ openwebui_namespace }}"
   register: _openwebui_config_resources
   loop:
     - { kind: ConfigMap, name: ollama-openwebui-config }
     - { kind: ConfigMap, name: openwebui-seed-config }
-    - { kind: Secret, name: openwebui-oauth-secret }
+    - { kind: Secret, name: openwebui-db-secret }
 
 - name: Compute config hash from configmap and secret data
   set_fact:
-    openwebui_config_hash: "{{ _openwebui_config_resources.results | map(attribute='resources') | map('first') | map(attribute='data') | map('to_json') | join('|') | hash('sha256') }}"
+    openwebui_config_hash: "{{ _openwebui_config_resources.results | map(attribute='resources') | map('first', default={}) | map(attribute='data', default={}) | map('to_json') | join('|') | hash('sha256') }}"
 
 
 - name: Deploy Open WebUI Deployment
