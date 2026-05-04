@@ -1,0 +1,602 @@
+#!/bin/bash
+set -euo pipefail
+
+DATA=/workspace
+APP="$DATA/comfyui"
+MODELS="$APP/models"
+
+# BUILDTIME is set by the Dockerfile at build time; older images (built
+# before the stamp was introduced) don't have the env var. `set -u`
+# would otherwise kill the script right here — hence the `:-unknown`
+# default instead of bare $BUILDTIME.
+echo "BUILDTIME: ${BUILDTIME:-unknown}"
+
+# --- 1. ComfyUI source ---------------------------------------------
+if [ ! -d "$APP/.git" ]; then
+  echo "[comfyui] cloning upstream…"
+  git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$APP"
+else
+  echo "[comfyui] pulling latest…"
+  git -C "$APP" pull --ff-only || echo "[comfyui] pull failed, continuing with existing checkout"
+fi
+
+# --- 2. Python deps ------------------------------------------------
+cd "$APP"
+if [ ! -f "$DATA/.pip_done" ] || [ requirements.txt -nt "$DATA/.pip_done" ]; then
+  echo "[comfyui] installing requirements…"
+  # torch already present from base image; --upgrade-strategy only-if-needed
+  # avoids reinstalling torch/torchvision and breaking Blackwell support.
+  pip install --upgrade-strategy only-if-needed -r requirements.txt
+  pip install huggingface_hub[cli]
+  touch "$DATA/.pip_done"
+fi
+
+# --- 3. FLUX.1-schnell single-file checkpoint ----------------------
+mkdir -p "$MODELS/checkpoints"
+FLUX_FILE="$MODELS/checkpoints/{{ comfyui_flux_schnell_file }}"
+if [ -n "{{ comfyui_flux_schnell_repo }}" ] && [ ! -f "$FLUX_FILE" ]; then
+  echo "[comfyui] downloading {{ comfyui_flux_schnell_repo }}/{{ comfyui_flux_schnell_file }}…"
+  # huggingface_hub >=1.11 removed `huggingface-cli` — the CLI is now
+  # called `hf` (same syntax, pure rename).
+  hf download "{{ comfyui_flux_schnell_repo }}" \
+    "{{ comfyui_flux_schnell_file }}" \
+    --local-dir "$MODELS/checkpoints"
+fi
+
+# --- 3b. Inpaint workflow models (HuggingFace, idempotent) --------
+# Target layout on spark4:$comfyui_hostpath_base → in the pod /workspace/:
+#   models/checkpoints/RealVisXL_V5.0_fp16.safetensors    (workflow.json SDXL)
+#   models/inpaint/{fooocus_inpaint_head.pth, inpaint_v26.fooocus.patch}
+#   models/diffusion_models/{flux1-fill-dev-fp8.safetensors,
+#                            flux1-dev-kontext_fp8_scaled.safetensors}
+#   models/text_encoders/{t5xxl_fp8_e4m3fn.safetensors, clip_l.safetensors}
+#   models/vae/ae.safetensors                              (FLUX VAE)
+#   models/clip_vision/{sigclip_vision_patch14_384.safetensors,
+#                       clip_vit_large_patch14.safetensors}
+#   models/style_models/flux1-redux-dev.safetensors        (Redux)
+#   models/xlabs/ipadapters/ip_adapter.safetensors         (IPA — XLabs legacy,
+#     no longer used by the plugin workflow; the path has to match
+#     x-flux-comfyui/nodes.py: dir_xlabs_ipadapters = models/xlabs/ipadapters,
+#     otherwise the LoadFluxIPAdapter dropdown is empty. XLabs also has an
+#     attn_mask bug against current ComfyUI core; if this custom node is
+#     actively used, patch layers.py:296.)
+#   models/ipadapter-flux/ip-adapter.bin                   (Shakker / InstantX
+#     IPA-Flux, the default path for comfyui-ipadapter-flux)
+#   models/clip_vision/siglip-so400m-patch14-384/          (HF-format dir
+#     for Shakker IPA: SiglipVisionModel.from_pretrained() needs
+#     config.json + model.safetensors + preprocessor_config.json — a single
+#     safetensors file is not enough)
+#   models/upscale_models/{4x-UltraSharp.pth,                (5 standard
+#                          4x_foolhardy_Remacri.pth,         upscalers for
+#                          4x_NMKD-Siax_200k.pth,            photo/architecture:
+#                          RealESRGAN_x4plus.pth,            UltraSharp = sharp,
+#                          RealESRGAN_x2plus.pth}            Remacri = preferred
+#                                                            for real-estate,
+#                                                            Siax = detail-outdoor,
+#                                                            RealESRGAN = workhorse;
+#                                                            x2plus for moderate
+#                                                            upscales)
+#
+# Note on directory conventions: ComfyUI renamed `models/clip/` →
+# `text_encoders/` and `models/unet/` → `diffusion_models/` (mid-2024).
+# Both old paths still work, but UNETLoader/DualCLIPLoader nodes default
+# to the new ones. We use the new names — the migration block right
+# under this list moves any pre-existing files from the old folders so
+# nothing gets downloaded twice.
+#
+# Per-line format: "repo|source_path|subdir[|rename_to]". If the 4th
+# field is present, the downloaded file is renamed to that name.
+#
+# All sources are ungated — no HF_TOKEN required.
+#
+# Mirror selection rationale:
+#   • flux1-dev-fp8     → Comfy-Org/flux1-dev (official ComfyUI mirror,
+#     ungated, all-in-one fp8 with UNet+CLIP+T5+VAE — loadable via
+#     CheckpointLoaderSimple, same structure as flux1-schnell-fp8).
+#   • flux1-fill-dev-fp8 → hfmaster/models-moved (Comfy-Org has only
+#     flux-dev, not Fill; hfmaster is a community bulk mirror, stable).
+#     Fallback if it disappears: boricuapab/flux1-fill-dev-fp8 (gated).
+#   • ae.safetensors    → Comfy-Org/flux1-dev (official ComfyUI mirror,
+#     identical to BFL — Flux VAE is the same across all Flux variants).
+#   • flux1-redux-dev   → Runware/FLUX.1-Redux-dev (dedicated mirror, ungated).
+#   • flux1-kontext-fp8 → Comfy-Org/flux1-kontext-dev_ComfyUI (official, ungated).
+#   • XLabs-IPA         → flux-ip-adapter-v2 (ip_adapter.safetensors); the
+#     v1 repo filename `flux-ip-adapter.safetensors` no longer exists on main.
+#   • Upscalers         → 4x-UltraSharp from Kim2091/UltraSharp (author's repo);
+#     4x_foolhardy_Remacri from FacehugmanIII/...; 4x_NMKD-Siax_200k from
+#     gemasai/...; RealESRGAN_x4plus + x2plus from xingren23/comfyflow-models
+#     (Comfy aggregator that mirrors xinntao's official weights from the
+#     upscale_models/ subpath — xinntao's own repo is gated).
+#
+# RealVisXL_V5.0 replaces the Civitai-gated `gene/juggernautXL_...` from
+# workflow.json — ungated, photo-realism, fully Fooocus-patch compatible.
+# `ckpt_name` in the workflow has to match: "RealVisXL_V5.0_fp16.safetensors"
+# (already set in workflow.json + workflow-manual.json).
+#
+# Plugin engines (Redux / IPA / Kontext) — additional reference-image-based
+# workflows, see COMFYUI_INPAINT.md.
+
+# Migration: move files from old directory conventions (clip/ →
+# text_encoders/, unet/ → diffusion_models/) into the new layout so
+# nothing gets downloaded twice. No-op when the old paths are empty.
+for migration in \
+  "clip|text_encoders" \
+  "unet|diffusion_models" \
+; do
+  IFS="|" read -r old_dir new_dir <<< "$migration"
+  if [ -d "$MODELS/$old_dir" ]; then
+    mkdir -p "$MODELS/$new_dir"
+    for f in "$MODELS/$old_dir"/*; do
+      [ -e "$f" ] || continue
+      base="$(basename "$f")"
+      if [ ! -e "$MODELS/$new_dir/$base" ]; then
+        echo "[comfyui] migrate: $f → $MODELS/$new_dir/$base"
+        mv "$f" "$MODELS/$new_dir/$base"
+      fi
+    done
+    rmdir "$MODELS/$old_dir" 2>/dev/null || true
+  fi
+done
+# Migration of old IPA and Kontext filenames to the names the current
+# workflow JSONs expect.
+for rename in \
+  "xlabs_ipadapters/flux-ip-adapter.safetensors|xlabs/ipadapters/ip_adapter.safetensors" \
+  "xlabs_ipadapters/ip_adapter.safetensors|xlabs/ipadapters/ip_adapter.safetensors" \
+  "diffusion_models/flux1-kontext-dev-fp8.safetensors|diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors" \
+; do
+  IFS="|" read -r old_rel new_rel <<< "$rename"
+  if [ -f "$MODELS/$old_rel" ] && [ ! -f "$MODELS/$new_rel" ]; then
+    echo "[comfyui] migrate: $MODELS/$old_rel → $MODELS/$new_rel"
+    mkdir -p "$(dirname "$MODELS/$new_rel")"
+    mv "$MODELS/$old_rel" "$MODELS/$new_rel"
+  fi
+done
+
+for entry in \
+  "SG161222/RealVisXL_V5.0|RealVisXL_V5.0_fp16.safetensors|checkpoints" \
+  "Comfy-Org/flux1-dev|flux1-dev-fp8.safetensors|checkpoints" \
+  "lllyasviel/fooocus_inpaint|fooocus_inpaint_head.pth|inpaint" \
+  "lllyasviel/fooocus_inpaint|inpaint_v26.fooocus.patch|inpaint" \
+  "comfyanonymous/flux_text_encoders|t5xxl_fp8_e4m3fn.safetensors|text_encoders" \
+  "comfyanonymous/flux_text_encoders|clip_l.safetensors|text_encoders" \
+  "Comfy-Org/flux1-dev|ae.safetensors|vae" \
+  "hfmaster/models-moved|flux/flux1-fill-dev-fp8.safetensors|diffusion_models" \
+  "Comfy-Org/sigclip_vision_384|sigclip_vision_patch14_384.safetensors|clip_vision" \
+  "XLabs-AI/flux-ip-adapter-v2|ip_adapter.safetensors|xlabs/ipadapters" \
+  "openai/clip-vit-large-patch14|model.safetensors|clip_vision|clip_vit_large_patch14.safetensors" \
+  "InstantX/FLUX.1-dev-IP-Adapter|ip-adapter.bin|ipadapter-flux" \
+  "Runware/FLUX.1-Redux-dev|flux1-redux-dev.safetensors|style_models" \
+  "Comfy-Org/flux1-kontext-dev_ComfyUI|split_files/diffusion_models/flux1-dev-kontext_fp8_scaled.safetensors|diffusion_models" \
+  "Kim2091/UltraSharp|4x-UltraSharp.pth|upscale_models" \
+  "FacehugmanIII/4x_foolhardy_Remacri|4x_foolhardy_Remacri.pth|upscale_models" \
+  "gemasai/4x_NMKD-Siax_200k|4x_NMKD-Siax_200k.pth|upscale_models" \
+  "xingren23/comfyflow-models|upscale_models/RealESRGAN_x4plus.pth|upscale_models" \
+  "xingren23/comfyflow-models|upscale_models/RealESRGAN_x2plus.pth|upscale_models" \
+; do
+  IFS="|" read -r repo fname subdir rename_to <<< "$entry"
+  dest_dir="$MODELS/$subdir"
+  final_name="${rename_to:-$(basename "$fname")}"
+  dest_file="$dest_dir/$final_name"
+  mkdir -p "$dest_dir"
+  if [ -f "$dest_file" ]; then
+    continue
+  fi
+  echo "[comfyui] downloading $repo/$fname → $dest_file"
+  # --local-dir places the file under the relative path the repo
+  # structure dictates (e.g. split_files/vae/ae.safetensors). After the
+  # download we flatten / rename so ComfyUI finds it directly under
+  # $dest_dir with the expected name — ComfyUI does not search model
+  # folders recursively.
+  if hf download "$repo" "$fname" --local-dir "$dest_dir"; then
+    nested="$dest_dir/$fname"
+    downloaded="$dest_dir/$(basename "$fname")"
+    if [ "$nested" != "$downloaded" ] && [ -f "$nested" ]; then
+      mv "$nested" "$downloaded"
+    fi
+    if [ "$downloaded" != "$dest_file" ] && [ -f "$downloaded" ]; then
+      mv "$downloaded" "$dest_file"
+    fi
+  else
+    echo "[comfyui] WARN: $repo/$fname could not be downloaded — please place $dest_file manually"
+  fi
+done
+
+# --- 3c. SigLIP-Vision (HF-format dir, not a single file) ----------
+# Shakker comfyui-ipadapter-flux loads CLIP-Vision via
+#   SiglipVisionModel.from_pretrained(<dir>)
+# i.e. we need the full HF repo as a directory, not just a single
+# .safetensors file. The folder name must be exactly
+# "siglip-so400m-patch14-384" (Shakker splits "google/siglip-so400m-patch14-384"
+# at the "/" and looks under CLIP_VISION_DIR + last segment).
+# Idempotent: if config.json is already there, skip.
+SIGLIP_DIR="$MODELS/clip_vision/siglip-so400m-patch14-384"
+if [ ! -f "$SIGLIP_DIR/config.json" ] || [ ! -f "$SIGLIP_DIR/model.safetensors" ]; then
+  echo "[comfyui] downloading google/siglip-so400m-patch14-384 -> $SIGLIP_DIR/"
+  mkdir -p "$SIGLIP_DIR"
+  if ! hf download google/siglip-so400m-patch14-384 --local-dir "$SIGLIP_DIR" \
+      --exclude "*.msgpack" --exclude "*.h5" --exclude "*.bin"; then
+    echo "[comfyui] WARN: SigLIP-SO400M could not be downloaded — Shakker IPA-Flux will not work"
+  fi
+fi
+
+# --- 4. Custom nodes for inpaint + flux-inpaint workflows ---------
+# Idempotent git clone per custom-node repo. If the target directory
+# already exists, nothing is done (NO pull — updates happen by hand or
+# via `rm -rf <dir>` + pod restart).
+# Acly/comfyui-inpaint-nodes → INPAINT_ApplyFooocusInpaint,
+#   INPAINT_LoadFooocusInpaint (+ LaMa, MAT fills)
+# lquesada/ComfyUI-Inpaint-CropAndStitch → InpaintCropImproved,
+#   InpaintStitchImproved — the "Improved" variants both workflows call
+#   directly. NOT in Acly's repo.
+# XLabs-AI/x-flux-comfyui → legacy. NO LONGER used by the plugin
+#   workflow; remains installed for backward compatibility (old
+#   workflows from the browser UI). Has an attn_mask bug against
+#   current ComfyUI core, upstream dead since 2024-10. If still used:
+#   patch layers.py:296 (extend the forward signature with
+#   attn_mask=None, **kwargs).
+# Shakker-Labs/ComfyUI-IPAdapter-Flux → IPAdapterFluxLoader +
+#   ApplyIPAdapterFlux. Actively maintained (last commit 2025-06),
+#   Apache 2.0, ComfyUI-native add_object_patch without direct block
+#   replace. Replaces XLabs as the IPA engine; see workflow-flux1-ipa.json /
+#   COMFYUI_INPAINT.md.
+mkdir -p "$APP/custom_nodes"
+
+# Canonical names (basename of repo, no .git). Order matches the for-loop
+# below. Used by the case-duplicate cleanup pass — see comments there.
+CANONICAL_CUSTOM_NODES="comfyui-inpaint-nodes ComfyUI-Inpaint-CropAndStitch x-flux-comfyui ComfyUI-IPAdapter-Flux"
+
+# Cleanup pass: ComfyUI scans every directory under custom_nodes/ recursively
+# and registers the contained nodes. On a case-sensitive filesystem (which is
+# all we have here), `ComfyUI-IPAdapter-Flux` and `comfyui-ipadapter-flux` are
+# two distinct directories — both get loaded, both register the same node
+# names, ComfyUI logs "duplicate node" warnings, and a workflow that hits
+# the wrong copy can crash on subtly different code. ComfyUI-Manager / manual
+# `git clone` with a typo'd capitalisation are the usual sources.
+#
+# For every canonical custom node we manage, scan custom_nodes/ for dirs
+# whose lowercased name matches the canonical lowercased name but whose
+# actual name does NOT match — those are case-variant duplicates and get
+# `rm -rf`'d. Idempotent: if there are no duplicates, no-op.
+#
+# This runs BEFORE the clone loop so the canonical clone below picks up
+# any reclaimed directory slot.
+for canonical in $CANONICAL_CUSTOM_NODES; do
+  canonical_lc=$(echo "$canonical" | tr '[:upper:]' '[:lower:]')
+  for dir in "$APP/custom_nodes"/*/; do
+    [ -d "$dir" ] || continue
+    base=$(basename "$dir")
+    base_lc=$(echo "$base" | tr '[:upper:]' '[:lower:]')
+    if [ "$base_lc" = "$canonical_lc" ] && [ "$base" != "$canonical" ]; then
+      echo "[comfyui] removing case-duplicate custom node: $base (canonical: $canonical)"
+      rm -rf "$dir"
+    fi
+  done
+done
+
+for repo in \
+  https://github.com/Acly/comfyui-inpaint-nodes.git \
+  https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch.git \
+  https://github.com/XLabs-AI/x-flux-comfyui.git \
+  https://github.com/Shakker-Labs/ComfyUI-IPAdapter-Flux.git \
+; do
+  name="$(basename "$repo" .git)"
+  dest="$APP/custom_nodes/$name"
+  if [ ! -d "$dest/.git" ]; then
+    echo "[comfyui] cloning custom node $name…"
+    git clone --depth 1 "$repo" "$dest"
+  fi
+done
+
+# --- 4a. Custom-node patches against API drift in current ComfyUI ---
+# Both IPA-Flux plugins (XLabs and Shakker-Labs) are unmaintained and
+# reference attributes / signatures that ComfyUI core has since moved
+# past. We patch idempotently in place — sed patterns match only the
+# un-patched original line, so repeated pod starts or a plugin update
+# via `rm -rf $name + restart` automatically re-apply the patch
+# without doubling up.
+#
+# Patch 1 (Shakker-Labs/ComfyUI-IPAdapter-Flux):
+#   File:  ComfyUI-IPAdapter-Flux/flux/layers.py:31
+#   Crash: AttributeError: 'DoubleStreamBlock' object has no attribute
+#          'flipped_img_txt'
+#   Cause: the plugin (HEAD eef22b6, 2025-06-22) expects this attribute
+#          on every ComfyUI DoubleStreamBlock. ComfyUI master no longer
+#          exposes it — only plugin-internal forks set it. Read it
+#          defensively via getattr() with default False (= classic
+#          Flux token layout, img before txt), which is semantically
+#          correct for all pre-Kontext Flux models.
+SHAKKER_LAYERS="$APP/custom_nodes/ComfyUI-IPAdapter-Flux/flux/layers.py"
+if [ -f "$SHAKKER_LAYERS" ] && grep -q '= original_block\.flipped_img_txt$' "$SHAKKER_LAYERS"; then
+  echo "[comfyui] patching $SHAKKER_LAYERS (DoubleStreamBlock.flipped_img_txt API drift)"
+  sed -i 's|= original_block\.flipped_img_txt$|= getattr(original_block, "flipped_img_txt", False)|' "$SHAKKER_LAYERS"
+fi
+
+# Patch 2 (Shakker-Labs/ComfyUI-IPAdapter-Flux):
+#   File:  ComfyUI-IPAdapter-Flux/utils.py:48
+#   Crash: TypeError: forward_orig_ipa() got an unexpected keyword argument
+#          'timestep_zero_index'
+#   Cause: the plugin monkey-patches ComfyUI's flux model.forward_orig
+#          with forward_orig_ipa(self, img, img_ids, txt, txt_ids,
+#                                timesteps, y, guidance=None, control=None,
+#                                transformer_options={}, attn_mask=None).
+#          ComfyUI master additionally calls forward_orig with
+#          timestep_zero_index= (and possibly more kwargs in the future).
+#          The plugin doesn't actually use any of those kwargs → defensively
+#          append a `**kwargs` to the signature, swallowing every unknown
+#          kwarg. Idempotent: the grep guard checks for the exact
+#          `    **kwargs,` line marker that only this patch produces.
+SHAKKER_UTILS="$APP/custom_nodes/ComfyUI-IPAdapter-Flux/utils.py"
+if [ -f "$SHAKKER_UTILS" ] \
+   && grep -q '^def forward_orig_ipa(' "$SHAKKER_UTILS" \
+   && ! grep -q '^    \*\*kwargs,$' "$SHAKKER_UTILS"; then
+  echo "[comfyui] patching $SHAKKER_UTILS (forward_orig_ipa **kwargs guard)"
+  sed -i 's/^    attn_mask: Tensor = None,$/&\n    **kwargs,/' "$SHAKKER_UTILS"
+fi
+
+# Patch 3 (XLabs-AI/x-flux-comfyui) — TODO, not active yet:
+#   File:  x-flux-comfyui/layers.py:296
+#   Symptom: forward(self, x, vec, pe) is called by newer ComfyUI with
+#            attn_mask=, but the old plugin code doesn't accept it.
+#   Fix:   extend the signature with `, attn_mask=None, **kwargs`
+#          (the plugin ignores the mask, no functional loss for IPA).
+# The plugin is legacy and no active workflows use it any more; if
+# someone hits this, add the corresponding sed block here.
+
+# --- 4b. Custom-node Python deps ----------------------------------
+# Each custom node may ship a requirements.txt (e.g. x-flux-comfyui:
+# opencv-python, einops, transformers, diffusers, sentencepiece,
+# GitPython — without these the plugin already fails on import with
+# `ModuleNotFoundError: No module named 'cv2'`).
+#
+# IMPORTANT — no hostPath marker: pip installs to
+# /usr/local/lib/python3.12/dist-packages/, which lives in the
+# container rootfs and is wiped on every pod restart. A marker under
+# $APP/custom_nodes/<node>/.deps_installed would survive on hostPath
+# and falsely flag the install as done → after a restart cv2 would be
+# missing despite the marker.
+# Therefore: run pip install on EVERY start. `--upgrade-strategy
+# only-if-needed` makes the run a no-op (~2s) when the deps are
+# already baked into the image (see scripts/comfyui/requirements-extra.txt
+# — GitPython, diffusers, opencv-python are pre-installed there).
+# It also protects the Blackwell-capable torch from the base image
+# against downgrades caused by custom-node pins.
+# Stale markers from older script versions are cleaned up.
+for req in "$APP"/custom_nodes/*/requirements.txt; do
+  [ -f "$req" ] || continue
+  node_dir="$(dirname "$req")"
+  rm -f "$node_dir/.deps_installed"
+  echo "[comfyui] ensuring deps for $(basename "$node_dir")…"
+  if ! pip install --upgrade-strategy only-if-needed -r "$req"; then
+    echo "[comfyui] WARN: pip install -r $req failed — node may not load"
+  fi
+done
+
+# --- 4c. SM121 SDPA shim for text encoders -------------------------
+# PyTorch 2.10's EFFICIENT_ATTENTION SDPA backend is numerically broken
+# on Blackwell GB10 / sm121: silently corrupts attention output without
+# crashing or producing NaN. CLIP-L embedding distance for two distinct
+# prompts collapses from ||A-B||=215 (CPU reference) to ~128 with
+# max|Δ|=25 at std≈1 — embeddings become near-random noise that still
+# passes NaN/inf checks. Verified empirically by running CLIPTextModel
+# on CPU vs GPU across {eager, SDPA-MATH, SDPA-EFFICIENT, SDPA-FLASH}:
+# EFFICIENT is the sole broken path; MATH and eager match CPU bit-near.
+# The "FATAL: kernel fmha_cutlassF_*_sm80" lines we filter further down
+# are emitted by exactly this kernel-table probe — on sm121 they are not
+# just cosmetic noise, they signal that the fallback kernel chosen by
+# aten::_efficient_attention_forward is the one returning garbage.
+#
+# Symptom in ComfyUI: outputs differ per prompt but bear no semantic
+# relation to the prompt text — "Prompt-Conditioning ignoriert Eingabe".
+#
+# Why our existing xformers patches (COMFYUI_SM121_PATCHES.md) do not
+# cover this: those patch xformers' own dispatcher to avoid cutlass and
+# FA3, routing xformers calls to fa2F-pt. ComfyUI's text encoders
+# bypass xformers entirely — they call optimized_attention_for_device(
+# ..., small_input=True), which hardcodes attention_pytorch in
+# comfy/ldm/modules/attention.py:762, and attention_pytorch builds on
+# F.scaled_dot_product_attention with no backend control. So even with
+# --use-sage-attention active (which only routes diffusion through Sage),
+# every text encoder forward goes through the broken SDPA path.
+#
+# Architecturally every text-encoder model in ComfyUI (CLIP-L, CLIP-G,
+# T5-XXL, Llama, Qwen, Gemma, Mistral, ByT5, …) inherits from
+# comfy.sd1_clip.SDClipModel and shares its forward(). Wrapping that
+# single forward in `with sdpa_kernel([SDPBackend.MATH])` therefore
+# fixes every encoder model with one patch — diffusion is untouched, so
+# Sage / xformers-fa2F-pt continue to drive the hot path. The CLIP
+# forward operates on a 77-token sequence; MATH backend's O(n²) cost
+# there is a few milliseconds, no measurable workflow penalty.
+#
+# Implementation: a sitecustomize.py loaded automatically by Python's
+# site.py at interpreter init, picked up via PYTHONPATH=$APP. It
+# installs a meta-path finder that fires once comfy.sd1_clip is
+# imported by ComfyUI, then patches SDClipModel.forward in place.
+# Idempotent (cls._sm121_sdpa_patched marker), no git-tracked file
+# modified, survives ComfyUI git pulls.
+# Disabled 2026-04-26: switched ComfyUI base image from
+# scitrera/dgx-spark-pytorch-dev:2.10.0-v2-cu131 to nvcr.io/nvidia/pytorch:26.03-py3
+# (NGC PyTorch — torch 2.11.0a0+nv26.03 / cu13.2). NGC's torch wheel
+# has correct SDPA EFFICIENT_ATTENTION on sm121 (verified empirically;
+# matrix in UPSTREAM_PYTORCH_SDPA_SM121.md). The shim is no longer
+# needed for default deployments — every text-encoder forward now runs
+# on the native EFFICIENT path without producing garbage embeddings.
+#
+# Kept as a commented heredoc for two reasons: (1) easy re-enable if a
+# future base-image regression brings the SDPA bug back, (2) the
+# rationale comment above remains the canonical explanation of the bug.
+# To re-activate, toggle SM121_SDPA_SHIM_ENABLED=1 below and redeploy.
+SM121_SDPA_SHIM_ENABLED=0
+
+# Cleanup: hostPath persists $APP/sitecustomize.py from any previous
+# invocation that had the shim enabled. Without this rm, an older shim file
+# would stay on disk forever and silently load when PYTHONPATH was set.
+# Idempotent — no-op when the file isn't there.
+if [ "$SM121_SDPA_SHIM_ENABLED" != "1" ]; then
+  if [ -f "$APP/sitecustomize.py" ]; then
+    echo "[comfyui] removing stale sm121 SDPA shim ($APP/sitecustomize.py)"
+    rm -f "$APP/sitecustomize.py"
+  fi
+fi
+
+if [ "$SM121_SDPA_SHIM_ENABLED" = "1" ]; then
+echo "[comfyui] writing sm121 SDPA text-encoder shim"
+cat > "$APP/sitecustomize.py" <<'PYEOF'
+"""sm121 SDPA workaround — see comfyui_launch.sh.j2 §4c for full rationale.
+
+PyTorch 2.10's EFFICIENT_ATTENTION SDPA backend silently corrupts
+attention output on Blackwell sm121. Wrap comfy.sd1_clip.SDClipModel.forward
+(base class for every ComfyUI text encoder) with sdpa_kernel([MATH]) so the
+encoder always uses the math backend, which is correct on sm121.
+"""
+import functools
+import importlib.abc
+import importlib.machinery
+import sys
+
+
+def _wrap_sd_clip_model(module):
+    cls = getattr(module, "SDClipModel", None)
+    if cls is None or getattr(cls, "_sm121_sdpa_patched", False):
+        return
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    orig = cls.forward
+
+    @functools.wraps(orig)
+    def patched(self, *args, **kwargs):
+        with sdpa_kernel([SDPBackend.MATH]):
+            return orig(self, *args, **kwargs)
+
+    cls.forward = patched
+    cls._sm121_sdpa_patched = True
+    print(
+        "[sm121-sdpa-shim] wrapped comfy.sd1_clip.SDClipModel.forward "
+        "with SDPA-MATH (workaround for sm121 EFFICIENT_ATTENTION bug)",
+        flush=True,
+    )
+
+
+class _SM121SDPALazyPatcher(importlib.abc.MetaPathFinder):
+    target = "comfy.sd1_clip"
+
+    def find_spec(self, name, path=None, target=None):
+        if name != self.target:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None or spec.loader is None:
+            return None
+        orig_loader = spec.loader
+
+        class _PostLoadWrapper(importlib.abc.Loader):
+            def create_module(self, spec):
+                return orig_loader.create_module(spec)
+
+            def exec_module(self, module):
+                orig_loader.exec_module(module)
+                try:
+                    _wrap_sd_clip_model(module)
+                except Exception as e:
+                    print(
+                        f"[sm121-sdpa-shim] WARN: failed to patch "
+                        f"SDClipModel.forward: {type(e).__name__}: {e}",
+                        flush=True,
+                    )
+
+        spec.loader = _PostLoadWrapper()
+        return spec
+
+
+if not any(isinstance(f, _SM121SDPALazyPatcher) for f in sys.meta_path):
+    sys.meta_path.insert(0, _SM121SDPALazyPatcher())
+    print("[sm121-sdpa-shim] installed lazy meta-path patcher for comfy.sd1_clip", flush=True)
+PYEOF
+
+# Make $APP visible to Python's site.py so sitecustomize.py is auto-loaded
+# at interpreter init. Set this only for the launch — pip installs above
+# this point have already finished, so they aren't affected.
+export PYTHONPATH="$APP:${PYTHONPATH:-}"
+fi  # SM121_SDPA_SHIM_ENABLED
+
+# --- 5. Launch -----------------------------------------------------
+# Debian/Ubuntu bases ship only `python3`; a `python` alias only exists
+# when the python-is-python3 package is installed. Resolve through PATH
+# so exec doesn't fail with "python: not found".
+#
+# --use-sage-attention: global attention backend = SageAttention v2.
+# Background: xformers' own FMHA dispatcher does not know about SM_121
+# (Blackwell GB10) and rejects the sm80-family kernels with
+#   FATAL: kernel '..._sm80' is for sm80-sm100, but was built for sm121
+# even when the binary is technically sm80-compatible. The FA3 path
+# (Hopper) has no loadable SASS for sm121 at all. Sage delivers better
+# throughput on Blackwell anyway and is verified functional on sm121
+# (bf16, multi-head). Until the xformers patches (see
+# COMFYUI_SM121_PATCHES.md) are baked into the image, Sage is the only
+# functional custom backend.
+PY="$(command -v python3 || command -v python)"
+echo "[comfyui] launching on 0.0.0.0:{{ comfyui_port }} ($PY)"
+
+# Filter cosmetic FATAL noise from PyTorch's CUTLASS kernel selector.
+# On sm121 (Blackwell GB10), PyTorch's `aten::_efficient_attention_forward`
+# probes its kernel table and prints
+#   FATAL: kernel `fmha_cutlassF_*_sm80` is for sm80-sm100, but was built for sm121
+# for every entry that doesn't match before settling on a viable kernel
+# (typically fa2F-pt). It's not a crash — verified by the integration test
+# (8/8 pass) — but each VAE attention call emits ~30 of these lines, which
+# floods the pod log. The printf is below TORCH_CPP_LOG_LEVEL and can't be
+# silenced via env var. The message comes from a C-level `printf(...)` and
+# therefore lands on stdout (fd 1), not stderr — verified empirically:
+# triggering EFFICIENT_ATTENTION on fp32 produced 2048 lines on fd 1 and 0
+# on fd 2. Filtering only fd 2 was a no-op. We now filter both fds. Pattern
+# is narrow: only `^FATAL: kernel ` is dropped, every other FATAL/error
+# line still passes through. `--line-buffered` keeps multi-line tracebacks
+# intact. Documented in COMFYUI_SM121_PATCHES.md ("Cosmetic FATAL noise").
+
+# exec > >(grep --line-buffered -v '^FATAL: kernel ')
+# exec 2> >(grep --line-buffered -v '^FATAL: kernel ' >&2)
+
+exec "$PY" main.py \
+  --listen 0.0.0.0 \
+  --port {{ comfyui_port }} \
+  --use-sage-attention \
+  --highvram \
+  --output-directory "$DATA/output" \
+  --temp-directory "$DATA/temp"
+
+# --highvram on DGX Spark (GB10, unified memory) — design notes:
+#
+# DGX Spark uses a unified-memory architecture: the Grace ARM CPU and
+# the Blackwell GPU share the same physical LPDDR5X pool (~128 GB per
+# node). Unlike a discrete GPU where "VRAM" and "host RAM" are
+# separate physical pools connected by PCIe, here both views map to
+# the same memory. ComfyUI's default "smart memory" mode is designed
+# around the dGPU model — it actively offloads model weights between
+# "GPU memory" and "host memory" to fit a small VRAM budget, paying
+# real PCIe transfer cost on a discrete card. On unified memory that
+# offloading is essentially free in terms of *data movement*, but
+# ComfyUI still pays the *software* cost: per-forward bookkeeping,
+# CUDA allocator updates, and the per-iteration loop seen in the log:
+#   loaded partially; 6978 MB loaded, 4371 MB offloaded   ← smart memory
+# That ~3 s/iter for FLUX (vs ~0.5–1 s/iter when fully resident) is
+# almost entirely software overhead, not data transfer.
+#
+# `--highvram` tells ComfyUI to keep loaded models entirely in the GPU
+# view and never partial-offload, eliminating the per-iteration
+# bookkeeping. On unified memory this gives the same effect as a
+# dGPU's full-VRAM-load case without the data-transfer cost on the
+# offload path — i.e. it's almost always the right setting on this
+# hardware.
+#
+# Caveat — GPU time-slicing: when 4-fold time-slicing is enabled (each
+# physical GPU appears as 4 logical replicas), ComfyUI sees only its
+# share of the unified pool as "GPU memory" via cudaMemGetInfo(). With
+# `--highvram` ComfyUI will reserve its full slice up front and not
+# release it back, even when idle. If a co-tenant pod (e.g. SGLang)
+# needs more memory at the same time, it gets the OOM, not us. If you
+# care about co-tenancy more than ComfyUI's own latency, drop the flag
+# (revert to "smart memory" / `--normalvram`); if ComfyUI runs alone
+# on the GPU or you'd rather have throughput than fairness, keep it.
+#
+# OOM behaviour: with `--highvram`, a model that doesn't fit will
+# crash the workflow rather than silently fall back to slow streaming.
+# That's almost always preferable for debugging — the failure points
+# at the real constraint (model size vs. budget) instead of hiding it
+# in a 5x slowdown.

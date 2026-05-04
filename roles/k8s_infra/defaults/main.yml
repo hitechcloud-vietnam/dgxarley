@@ -28,3 +28,4 @@ traefik_dashboard_password: "changeme"
 
 # KCEVE KVM RS232 serial device on k3smaster (USB-to-RS232 adapter)
 kceve_kvm_serial_device: "/dev/ttyACM0"
+

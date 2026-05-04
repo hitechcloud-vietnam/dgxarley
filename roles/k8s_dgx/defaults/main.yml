@@ -65,8 +65,9 @@ sglang_enable_spec_v2: "{{ sglang_model_profiles[sglang_model].enable_spec_v2 | 
 #sglang_model: "Qwen/Qwen3.5-35B-A3B-FP8"
 #sglang_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
 
-sglang_model: "nvidia/Qwen3.5-397B-A17B-NVFP4"
+# sglang_model: "nvidia/Qwen3.5-397B-A17B-NVFP4"
 # sglang_model: "google/gemma-4-26B-A4B-it"
+sglang_model: "Qwen/Qwen3.6-35B-A3B-FP8"
 # sglang_model: "nvidia/Qwen3-235B-A22B-NVFP4"
 # sglang_model: "zai-org/GLM-4.7-FP8"
 
@@ -81,7 +82,7 @@ sglang_model: "nvidia/Qwen3.5-397B-A17B-NVFP4"
 #sglang_model: "google/gemma-4-31B-it"        # 30.7B dense, multimodal, 256K ctx
 #sglang_model: "google/gemma-4-26B-A4B-it"    # 26B/3.8B-active MoE, multimodal, 256K ctx
 
-sglang_image: "{{ sglang_model_profiles[sglang_model].sglang_image | default(default_sglang_image) }}"
+sglang_image: "scitrera/dgx-spark-sglang:0.5.10"
 
 sglang_context_length: "{{ sglang_model_profiles[sglang_model].context_length }}"
 sglang_kv_cache_dtype: "{{ sglang_model_profiles[sglang_model].kv_cache_dtype }}"
@@ -485,6 +486,8 @@ hf_cache_path: "/var/lib/hf-cache"
 hf_token: "hf_CHANGEME"
 # HuggingFace model pre-download Job
 hf_preload_models:
+  - "Qwen/Qwen3.6-35B-A3B-FP8"
+  - "Qwen/Qwen3.6-27B-FP8"
   - "togethercomputer/Aurora-Spec-Minimax-M2.5"
   - "lmsys/Qwen3-235B-A22B-EAGLE3"
   - "nvidia/Qwen3-235B-A22B-Eagle3"
@@ -554,12 +557,15 @@ _sglang_extra_body_defaults: >-
 # Nothing is precompiled into the image; the container clones ComfyUI on first
 # start into hostPath and downloads the FLUX.1-schnell fp8 single-file checkpoint
 # (~17 GB, Apache-2.0, no HF gating) into models/checkpoints.
-comfyui_enabled: false
+comfyui_enabled: true
 comfyui_namespace: "comfyui"
-# NGC PyTorch image ships CUDA + cuDNN + torch with Blackwell (SM121) support
-# on ARM64. Overkill for a playground but avoids the custom-wheels rabbit hole.
-# Alternative: build a slimmer image once we know which kernels ComfyUI pulls.
-comfyui_image: "nvcr.io/nvidia/pytorch:25.09-py3"
+# Custom image built by scripts/build_comfyui_image.sh on top of NGC PyTorch
+# (nvcr.io/nvidia/pytorch:26.03-py3 default since 2026-04-26). NGC base is
+# the only verified-correct sm121 SDPA option — scitrera-pipeline bases ship
+# a torch wheel with silently broken EFFICIENT_ATTENTION. See
+# UPSTREAM_PYTORCH_SDPA_SM121.md / COMFYUI_PROMPT_FAIL.md for the diagnosis,
+# and COMFYUI_ARM64_SM121.md / scripts/comfyui/Dockerfile for the build.
+comfyui_image: "xomoxcc/comfyui:sm121"
 comfyui_port: 8188
 # Which Spark to pin ComfyUI to. spark4 is the least disruptive default (last
 # SGLang worker; during image generation only rank 3 takes a latency hit).
@@ -782,3 +788,50 @@ litellm_settings:
 
 # Empty default — guardrails block is omitted from config.yaml when empty.
 litellm_guardrails: []
+
+# === Nous Hermes Agent (per-user deployments) ===
+# Two independent Deployments per active user, both pinned to k3smaster:
+#   hermes-agent-<user>  → official nousresearch/hermes-agent (`hermes dashboard`)
+#   hermes-webui-<user>  → ghcr.io/nesquena/hermes-webui (alt browser UI)
+# They share /opt/data via the same hostPath subdir, so sessions/skills/configs
+# are identical across both UIs. Each one still spawns its own hermes processes
+# when chatting — Hermes is a CLI, not a daemon; there is no shared agent
+# process to multiplex onto.
+hermes_namespace: "hermes"
+hermes_image_tag: "v2026.4.30"
+# NFS-backed hostPath base on k3smaster — per-user subdirs <base>/<username>
+# are mounted as /opt/data inside the pod (subdir-only, no parent visibility).
+hermes_data_base: "/mnt/nfs/hermes"
+hermes_default_model: "Qwen/Qwen3.6-35B-A3B-FP8"
+hermes_litellm_url: "http://litellm.litellm.svc.cluster.local:4000"
+hermes_webui_image: "ghcr.io/nesquena/hermes-webui"
+hermes_webui_image_tag: "latest"
+hermes_webui_port: 8787
+# Caddy sidecar in front of the agent dashboard. Cookie-session auth (via the
+# caddy-security plugin) so WebSocket (TUI/PTY) and EventSource (events feed)
+# work — BasicAuth credentials are NOT auto-included by browsers on those
+# requests. oauth2-proxy v7 was tried first but rejects WS upgrades with 403
+# even with --skip-auth-route; caddy-security checks the cookie only on the
+# initial handshake and transparently passes the upgrade through. The image is
+# greenpau/caddy-security packaged as `authcrunch/authcrunch` (multi-arch).
+hermes_caddy_image: "ghcr.io/authcrunch/authcrunch"
+hermes_caddy_image_tag: "latest"
+hermes_agent_proxy_port: 9118
+# Per-user defaults — overridable per entry in hermes_users.
+hermes_dashboard_enabled_default: true
+hermes_dashboard_tui_default: true
+hermes_webui_enabled_default: false
+# Sets logging.level=DEBUG in the rendered config.yaml (otherwise INFO).
+# Affects /opt/data/logs/agent.log — kubectl logs -c log-tail <pod> tails it.
+hermes_debug_default: false
+# Per-user list — real entries in group_vars/all/vault.yml.
+# Schema: { username, uid, gid, litellm_token,
+#           litellm_model?, basicauth_password?, webui_password?,
+#           dashboard_enabled? (default true),
+#           dashboard_tui?     (default true),
+#           webui_enabled?     (default false),
+#           hermes_debug?      (default false),
+#           enabled }
+# Hostnames: <username>.hermes-dashboard.<dns> (original)  +  <username>.hermes.<dns> (webui)
+hermes_users: []
+
